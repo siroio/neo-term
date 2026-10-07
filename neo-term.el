@@ -8,19 +8,28 @@
 (require 'subr-x)
 (require 'svg)
 
-(defgroup neo-term nil "Windows native terminals." :group 'processes)
+(defgroup neo-term nil "Windows native terminals."
+  :group 'processes)
 (defconst neo-term--directory (file-name-directory (or load-file-name buffer-file-name)))
 (defcustom neo-term-host-program (expand-file-name "build/neo-term-host.exe" neo-term--directory)
-  "Path to the native helper." :type 'file)
+  "Path to the native helper."
+  :type 'file)
 (defcustom neo-term-backend 'auto
   "Backend selected before the shell starts."
-  :type '(choice (const auto) (const bundled-conpty) (const system-conpty) (const classic)))
-(defcustom neo-term-no-conpty nil "Exclude both ConPTY backends." :type 'boolean)
+  :type '(choice (const auto)
+                 (const bundled-conpty)
+                 (const system-conpty)
+                 (const classic)))
+(defcustom neo-term-no-conpty nil "Exclude both ConPTY backends."
+  :type 'boolean)
 (defcustom neo-term-shell (or (executable-find "pwsh.exe") "powershell.exe")
-  "Shell executable." :type 'string)
+  "Shell executable."
+  :type 'string)
 (defcustom neo-term-shell-arguments '("-NoLogo" "-NoProfile")
-  "Arguments passed directly to the shell." :type '(repeat string))
-(defcustom neo-term-scrollback-lines 2000 "Maximum retained history lines." :type 'natnum)
+  "Arguments passed directly to the shell."
+  :type '(repeat string))
+(defcustom neo-term-scrollback-lines 2000 "Maximum retained history lines."
+  :type 'natnum)
 (defconst neo-term--max-frame (* 4 1024 1024))
 (defvar-local neo-term--process nil)
 (defvar-local neo-term--session nil)
@@ -41,13 +50,16 @@
 (defvar neo-term-copy-mode-map)
 
 (defun neo-term--frame (text)
-  (let* ((bytes (encode-coding-string text 'utf-8 t)) (size (length bytes)))
-    (unless (<= 1 size neo-term--max-frame) (error "Invalid terminal frame size"))
+  (let* ((bytes (encode-coding-string text 'utf-8 t))
+         (size (length bytes)))
+    (unless (<= 1 size neo-term--max-frame)
+      (error "Invalid terminal frame size"))
     (concat (apply #'unibyte-string (cl-loop for shift from 0 to 24 by 8
-                                           collect (logand 255 (ash size (- shift))))) bytes)))
+                                             collect (logand 255 (ash size (- shift))))) bytes)))
 
 (defun neo-term--send (command)
-  (unless (process-live-p neo-term--process) (user-error "Terminal has exited"))
+  (unless (process-live-p neo-term--process)
+    (user-error "Terminal has exited"))
   (process-send-string neo-term--process (neo-term--frame command)))
 
 (defun neo-term--consume (bytes)
@@ -55,74 +67,131 @@
   (let ((more t))
     (while (and more (>= (length neo-term--pending) 4))
       (let ((size (cl-loop for index below 4 sum
-                           (ash (aref neo-term--pending index) (* 8 index)))))
-        (unless (<= 1 size neo-term--max-frame) (error "Invalid terminal frame size: %s" size))
-        (if (< (length neo-term--pending) (+ 4 size)) (setq more nil)
+                           (ash (aref neo-term--pending index)
+                                (* 8 index)))))
+        (unless (<= 1 size neo-term--max-frame)
+          (error "Invalid terminal frame size: %s" size))
+        (if (< (length neo-term--pending)
+               (+ 4 size))
+            (setq more nil)
           (let ((payload (substring neo-term--pending 4 (+ 4 size))))
             (setq neo-term--pending (substring neo-term--pending (+ 4 size)))
             (neo-term--event (json-parse-string (decode-coding-string payload 'utf-8 t)
-                                              :object-type 'alist :array-type 'array
-                                              :null-object nil :false-object nil))))))))
+                                                :object-type 'alist
+                                                :array-type 'array
+                                                :null-object nil
+                                                :false-object nil))))))))
 
 (defun neo-term--event (event)
-  (unless (eql (alist-get 'v event) 1) (error "Unsupported terminal protocol"))
+  (unless (eql (alist-get 'v event) 1)
+    (error "Unsupported terminal protocol"))
   (pcase (alist-get 'type event)
-    ("ready" (setq neo-term--session event neo-term--status (alist-get 'backend event)))
-    ("screen" (neo-term--screen event))
-    ("exit" (setq neo-term--status (format "exit %s" (alist-get 'code event))))
-    ("error" (setq neo-term--status "error") (message "neo-term: %s" (alist-get 'message event)))
+    ("ready"
+     (setq neo-term--session event
+           neo-term--status (alist-get 'backend event)))
+    ("screen"
+     (neo-term--screen event))
+    ("exit"
+     (setq neo-term--status (format "exit %s"
+                                    (alist-get 'code event))))
+    ("error"
+     (setq neo-term--status "error")
+     (message "neo-term: %s"
+              (alist-get 'message event)))
     (_ (error "Unknown terminal event")))
   (force-mode-line-update))
 
 (defun neo-term--cell-face (cell)
-  (let ((fg (aref cell 2)) (bg (aref cell 3)) (bits (aref cell 4)) result)
-    (when (>= fg 0) (setq result (plist-put result :foreground (format "#%06x" fg))))
-    (when (>= bg 0) (setq result (plist-put result :background (format "#%06x" bg))))
-    (when (/= 0 (logand bits 1)) (setq result (plist-put result :weight 'bold)))
-    (when (/= 0 (logand bits 2)) (setq result (plist-put result :underline t)))
-    (when (/= 0 (logand bits 4)) (setq result (plist-put result :slant 'italic)))
-    (when (/= 0 (logand bits 8)) (setq result (plist-put result :inverse-video t)))
-    (when (/= 0 (logand bits 16)) (setq result (plist-put result :strike-through t)))
+  (let ((fg (aref cell 2))
+        (bg (aref cell 3))
+        (bits (aref cell 4)) result)
+    (when (>= fg 0)
+      (setq result (plist-put result
+                              :foreground (format "#%06x" fg))))
+    (when (>= bg 0)
+      (setq result (plist-put result
+                              :background (format "#%06x" bg))))
+    (when (/= 0 (logand bits 1))
+      (setq result (plist-put result
+                              :weight 'bold)))
+    (when (/= 0 (logand bits 2))
+      (setq result (plist-put result
+                              :underline t)))
+    (when (/= 0 (logand bits 4))
+      (setq result (plist-put result
+                              :slant 'italic)))
+    (when (/= 0 (logand bits 8))
+      (setq result (plist-put result
+                              :inverse-video t)))
+    (when (/= 0 (logand bits 16))
+      (setq result (plist-put result
+                              :strike-through t)))
     result))
 
 (defun neo-term--validate-line (cells cols)
-  (unless (vectorp cells) (error "Invalid terminal cells"))
+  (unless (vectorp cells)
+    (error "Invalid terminal cells"))
   (let ((width 0))
     (cl-loop for cell across cells do
-             (unless (and (vectorp cell) (= (length cell) 5)
-                          (stringp (aref cell 0)) (<= 1 (length (aref cell 0)) 16)
+             (unless (and (vectorp cell)
+                          (= (length cell) 5)
+                          (stringp (aref cell 0))
+                          (<= 1 (length (aref cell 0)) 16)
                           (memq (aref cell 1) '(1 2))
                           (cl-loop for index from 2 to 3 always
-                                   (and (integerp (aref cell index)) (<= -1 (aref cell index) #xffffff)))
-                          (integerp (aref cell 4)) (<= 0 (aref cell 4) 31))
+                                   (and (integerp (aref cell index))
+                                        (<= -1 (aref cell index) #xffffff)))
+                          (integerp (aref cell 4))
+                          (<= 0 (aref cell 4) 31))
                (error "Invalid terminal cell"))
              (cl-incf width (aref cell 1)))
-    (unless (= width cols) (error "Terminal cell widths do not match columns"))))
+    (unless (= width cols)
+      (error "Terminal cell widths do not match columns"))))
 
 (defun neo-term--screen (event)
-  (let ((cols (alist-get 'cols event)) (height (alist-get 'height event))
-        (x (alist-get 'x event)) (y (alist-get 'y event)))
-    (unless (and (integerp cols) (<= 2 cols 300) (integerp height) (<= 2 height 200)
-                 (integerp x) (<= 0 x cols) (integerp y) (<= 0 y (1- height)))
+  (let ((cols (alist-get 'cols event))
+        (height (alist-get 'height event))
+        (x (alist-get 'x event))
+        (y (alist-get 'y event)))
+    (unless (and (integerp cols)
+                 (<= 2 cols 300)
+                 (integerp height)
+                 (<= 2 height 200)
+                 (integerp x)
+                 (<= 0 x cols)
+                 (integerp y)
+                 (<= 0 y (1- height)))
       (error "Invalid terminal dimensions or cursor"))
-    (unless (and (= cols neo-term--cols) (= height neo-term--height))
+    (unless (and (= cols neo-term--cols)
+                 (= height neo-term--height))
       (setq neo-term--lines (make-vector height nil)))
-    (setq neo-term--cols cols neo-term--height height neo-term--cursor (cons x y)
-          neo-term--visible (alist-get 'visible event) neo-term--alt (alist-get 'alt event))
+    (setq neo-term--cols cols
+          neo-term--height height
+          neo-term--cursor (cons x y)
+          neo-term--visible (alist-get 'visible event)
+          neo-term--alt (alist-get 'alt event))
     (cl-loop for row across (alist-get 'rows event) do
-             (unless (and (vectorp row) (= (length row) 2) (integerp (aref row 0))
-                          (<= 0 (aref row 0) (1- height))) (error "Invalid terminal row"))
+             (unless (and (vectorp row)
+                          (= (length row) 2)
+                          (integerp (aref row 0))
+                          (<= 0 (aref row 0)
+                              (1- height)))
+               (error "Invalid terminal row"))
              (neo-term--validate-line (aref row 1) cols)
-             (aset neo-term--lines (aref row 0) (aref row 1)))
+             (aset neo-term--lines (aref row 0)
+                   (aref row 1)))
     (cl-loop for line across (alist-get 'history event) do
-             (unless (stringp line) (error "Invalid terminal history"))
+             (unless (stringp line)
+               (error "Invalid terminal history"))
              (setq neo-term--history (nconc neo-term--history (list line))))
     (when (> (length neo-term--history) neo-term-scrollback-lines)
-      (setq neo-term--history (nthcdr (- (length neo-term--history) neo-term-scrollback-lines) neo-term--history)))
+      (setq neo-term--history (nthcdr (- (length neo-term--history) neo-term-scrollback-lines)
+                                      neo-term--history)))
     (cond (neo-term--copy nil)
           (noninteractive (neo-term--render))
           ((null neo-term--timer)
-           (setq neo-term--timer (run-at-time .02 nil #'neo-term--render-buffer (current-buffer)))))))
+           (setq neo-term--timer (run-at-time .02 nil #'neo-term--render-buffer
+                                              (current-buffer)))))))
 
 (defun neo-term--render-buffer (buffer)
   (when (buffer-live-p buffer)
@@ -133,55 +202,84 @@
 (defun neo-term--cell-display (text width face)
   (when (display-graphic-p)
     (let* ((pixels (* width (frame-char-width)))
-           (key (list text width face (frame-parameter nil 'font) (frame-char-width) (frame-char-height)
-                      (face-attribute 'fixed-pitch :family nil t)
-                      (face-foreground 'default nil t) (face-background 'default nil t)))
+           (key (list text width face (frame-parameter nil 'font)
+                      (frame-char-width)
+                      (frame-char-height)
+                      (face-attribute 'fixed-pitch
+                                      :family nil t)
+                      (face-foreground 'default nil t)
+                      (face-background 'default nil t)))
            (cached (gethash key neo-term--glyph-cache 'missing)))
       (if (not (eq cached 'missing)) cached
         (let* ((base-face (append face '(:inherit fixed-pitch)))
                (actual (string-pixel-width (propertize text 'face base-face)))
                (image nil))
           (when (/= actual pixels)
-            (unless (image-type-available-p 'svg) (error "SVG support is required to fit terminal glyphs"))
+            (unless (image-type-available-p 'svg)
+              (error "SVG support is required to fit terminal glyphs"))
             (let* ((height (frame-char-height))
                    (svg (svg-create pixels height))
-                   (fg (or (plist-get face :foreground) (face-foreground 'default nil t)))
-                   (bg (or (plist-get face :background) (face-background 'default nil t))))
-              (when (plist-get face :inverse-video) (cl-rotatef fg bg))
-              (svg-text svg text :x 0 :y (* height .8) :font-size (* height .8)
-                        :font-family (face-attribute 'fixed-pitch :family nil t)
-                        :font-weight (if (eq (plist-get face :weight) 'bold) "bold" "normal")
-                        :font-style (if (eq (plist-get face :slant) 'italic) "italic" "normal")
-                        :text-decoration (string-join (delq nil (list (when (plist-get face :underline) "underline")
-                                                                     (when (plist-get face :strike-through) "line-through"))) " ")
-                        :fill fg :transform (format "scale(%s 1)" (/ (float pixels) (max 1 actual))))
-              (setq image (svg-image svg :ascent 'center :scale 1 :background bg))))
-          (when (= (hash-table-count neo-term--glyph-cache) 512) (clrhash neo-term--glyph-cache))
+                   (fg (or (plist-get face
+                                      :foreground)
+                           (face-foreground 'default nil t)))
+                   (bg (or (plist-get face
+                                      :background)
+                           (face-background 'default nil t))))
+              (when (plist-get face
+                               :inverse-video)
+                (cl-rotatef fg bg))
+              (svg-text svg text
+                        :x 0
+                        :y (* height .8)
+                        :font-size (* height .8)
+                        :font-family (face-attribute 'fixed-pitch
+                                                     :family nil t)
+                        :font-weight (if (eq (plist-get face
+                                                        :weight) 'bold) "bold" "normal")
+                        :font-style (if (eq (plist-get face
+                                                       :slant) 'italic) "italic" "normal")
+                        :text-decoration (string-join (delq nil (list (when (plist-get face
+                                                                                       :underline) "underline")
+                                                                      (when (plist-get face
+                                                                                       :strike-through) "line-through"))) " ")
+                        :fill fg
+                        :transform (format "scale(%s 1)"
+                                           (/ (float pixels)
+                                              (max 1 actual))))
+              (setq image (svg-image svg
+                                     :ascent 'center
+                                     :scale 1
+                                     :background bg))))
+          (when (= (hash-table-count neo-term--glyph-cache) 512)
+            (clrhash neo-term--glyph-cache))
           (puthash key image neo-term--glyph-cache))))))
 
 (defun neo-term--render ()
-  (let ((inhibit-read-only t) (cursor-position nil) (screen-start nil))
+  (let ((inhibit-read-only t)
+        (cursor-position nil)
+        (screen-start nil))
     (erase-buffer)
     (unless neo-term--alt
-      (dolist (line neo-term--history) (insert line "\n")))
+      (dolist (line neo-term--history)
+        (insert line "\n")))
     (setq screen-start (point))
     (dotimes (row neo-term--height)
-      (let ((column 0) (cells (aref neo-term--lines row)))
-        (if (null cells) (insert (make-string neo-term--cols ?\s))
+      (let ((column 0)
+            (cells (aref neo-term--lines row)))
+        (if (null cells)
+            (insert (make-string neo-term--cols ?\s))
           (cl-loop for cell across cells do
                    (when (and (= row (cdr neo-term--cursor))
-                              (null cursor-position) (>= column (car neo-term--cursor)))
+                              (null cursor-position)
+                              (>= column (car neo-term--cursor)))
                      (setq cursor-position (point)))
-                   (let ((text (aref cell 0)))
-                     (set-char-table-range char-width-table (aref text 0) (aref cell 1))
-                     (cl-loop for index from 1 below (length text) do
-                              (set-char-table-range char-width-table (aref text index) 0))
-                     (let ((face (neo-term--cell-face cell)))
-                       (insert (propertize text 'face face 'display (neo-term--cell-display text (aref cell 1) face)))))
+                   (neo-term--insert-cell cell)
                    (cl-incf column (aref cell 1))))
-        (when (and (= row (cdr neo-term--cursor)) (null cursor-position))
+        (when (and (= row (cdr neo-term--cursor))
+                   (null cursor-position))
           (setq cursor-position (point))))
-      (unless (= row (1- neo-term--height)) (insert "\n")))
+      (unless (= row (1- neo-term--height))
+        (insert "\n")))
     (goto-char (or cursor-position screen-start))
     (setq cursor-type (if neo-term--visible 'box nil))
     (dolist (window (get-buffer-window-list (current-buffer) nil t))
@@ -189,48 +287,95 @@
       (set-window-point window (point)))
     (set-buffer-modified-p nil)))
 
+(defun neo-term--insert-cell (cell)
+  (let ((text (aref cell 0))
+        (width (aref cell 1)))
+    (set-char-table-range char-width-table (aref text 0) width)
+    (cl-loop for index from 1 below (length text)
+             do (set-char-table-range char-width-table (aref text index) 0))
+    (let* ((face (neo-term--cell-face cell))
+           (display (neo-term--cell-display text width face)))
+      (insert (propertize text 'face face 'display display)))))
+
 (defun neo-term--key-command (event)
-  (let* ((basic (event-basic-type event)) (modifiers (event-modifiers event))
-         (bits (+ (if (memq 'shift modifiers) 1 0) (if (memq 'meta modifiers) 2 0)
+  (let* ((basic (event-basic-type event))
+         (modifiers (event-modifiers event))
+         (bits (+ (if (memq 'shift modifiers) 1 0)
+                  (if (memq 'meta modifiers) 2 0)
                   (if (memq 'control modifiers) 4 0)))
-         (key (cdr (assq basic '((return . 1) (tab . 2) (backspace . 3) (escape . 4)
-                                (up . 5) (down . 6) (left . 7) (right . 8) (insert . 9)
-                                (delete . 10) (home . 11) (end . 12) (prior . 13) (next . 14))))))
-    (when (and (symbolp basic) (string-match "\\`f\\([0-9]+\\)\\'" (symbol-name basic)))
+         (key (cdr (assq basic '((return . 1)
+                                 (tab . 2)
+                                 (backspace . 3)
+                                 (escape . 4)
+                                 (up . 5)
+                                 (down . 6)
+                                 (left . 7)
+                                 (right . 8)
+                                 (insert . 9)
+                                 (delete . 10)
+                                 (home . 11)
+                                 (end . 12)
+                                 (prior . 13)
+                                 (next . 14))))))
+    (when (and (symbolp basic)
+               (string-match "\\`f\\([0-9]+\\)\\'"
+                             (symbol-name basic)))
       (let ((number (string-to-number (match-string 1 (symbol-name basic)))))
-        (when (<= 1 number 24) (setq key (+ 256 number)))))
+        (when (<= 1 number 24)
+          (setq key (+ 256 number)))))
     (cond (key (format "K%s,%s" key bits))
           ((integerp basic)
            (pcase basic
-             (13 (format "K1,%s" (logand bits 3)))
-             (9 (format "K2,%s" (logand bits 3)))
+             (13 (format "K1,%s"
+                         (logand bits 3)))
+             (9 (format "K2,%s"
+                        (logand bits 3)))
              (127 (format "K3,%s" bits))
              (27 (format "K4,%s" bits))
-             (_ (if (= 0 (logand bits 6)) (concat "T" (char-to-string event))
+             (_ (if (= 0 (logand bits 6))
+                    (concat "T"
+                            (char-to-string event))
                   (format "U%s,%s" basic bits)))))
           (t (user-error "Unsupported terminal key: %s" event)))))
 
-(defun neo-term-send-key () "Send the current key to the terminal." (interactive)
+(defun neo-term-send-key ()
+  "Send the current key to the terminal."
+  (interactive)
   (neo-term--send (neo-term--key-command last-command-event)))
-(defun neo-term-send-next-key () "Read and send a key, including reserved Emacs keys." (interactive)
+(defun neo-term-send-next-key ()
+  "Read and send a key, including reserved Emacs keys."
+  (interactive)
   (neo-term--send (neo-term--key-command (read-key "Terminal key: "))))
-(defun neo-term-paste (text) "Paste TEXT into the terminal." (interactive (list (current-kill 0)))
+(defun neo-term-paste (text)
+  "Paste TEXT into the terminal."
+  (interactive (list (current-kill 0)))
   (neo-term--send (concat "P" text)))
-(defun neo-term-copy-mode () "Toggle selection and history browsing." (interactive)
+(defun neo-term-copy-mode ()
+  "Toggle selection and history browsing."
+  (interactive)
   (setq neo-term--copy (not neo-term--copy))
   (use-local-map (if neo-term--copy neo-term-copy-mode-map neo-term-mode-map))
-  (if neo-term--copy (setq cursor-type 'bar) (neo-term--render))
+  (if neo-term--copy (setq cursor-type 'bar)
+    (neo-term--render))
   (force-mode-line-update))
-(defun neo-term-close () "Close the terminal and its child processes." (interactive)
+(defun neo-term-close ()
+  "Close the terminal and its child processes."
+  (interactive)
   (kill-buffer (current-buffer)))
-(defun neo-term-describe-session () "Show the backend selected for this session." (interactive)
-  (message "%s" (if neo-term--session
-                    (format "%s | %s | attempts: %S" (alist-get 'backend neo-term--session)
-                            (alist-get 'runtime neo-term--session) (alist-get 'attempts neo-term--session))
-                  neo-term--status)))
+(defun neo-term-describe-session ()
+  "Show the backend selected for this session."
+  (interactive)
+  (message "%s"
+           (if neo-term--session
+               (format "%s | %s | attempts: %S"
+                       (alist-get 'backend neo-term--session)
+                       (alist-get 'runtime neo-term--session)
+                       (alist-get 'attempts neo-term--session))
+             neo-term--status)))
 
 (defvar neo-term-mode-map
-  (let ((map (make-keymap)) (prefix (make-sparse-keymap)))
+  (let ((map (make-keymap))
+        (prefix (make-sparse-keymap)))
     (set-char-table-range (nth 1 map) t #'neo-term-send-key)
     (define-key map [t] #'neo-term-send-key)
     (set-keymap-parent prefix ctl-x-map)
@@ -251,7 +396,8 @@
     map))
 
 (defun neo-term--cleanup ()
-  (when (timerp neo-term--timer) (cancel-timer neo-term--timer))
+  (when (timerp neo-term--timer)
+    (cancel-timer neo-term--timer))
   (when (process-live-p neo-term--process)
     (ignore-errors (neo-term--send "C"))
     (delete-process neo-term--process)))
@@ -263,9 +409,11 @@
   (setq-local scroll-margin 0)
   (setq-local line-spacing 0)
   (setq-local char-width-table (copy-sequence char-width-table))
-  (setq neo-term--glyph-cache (make-hash-table :test 'equal))
+  (setq neo-term--glyph-cache (make-hash-table
+                               :test 'equal))
   (setq-local show-trailing-whitespace nil)
-  (setq-local mode-line-process '(:eval (format " [%s%s]" neo-term--status (if neo-term--copy " copy" ""))))
+  (setq-local mode-line-process '(:eval (format " [%s%s]" neo-term--status (if neo-term--copy
+                                                                               " copy" ""))))
   (setq-local buffer-face-mode-face 'fixed-pitch)
   (buffer-face-mode 1)
   (add-hook 'kill-buffer-hook #'neo-term--cleanup nil t))
@@ -276,47 +424,76 @@
 (defun neo-term--resize (_frame)
   (dolist (window (window-list))
     (with-current-buffer (window-buffer window)
-      (when (and (derived-mode-p 'neo-term-mode) (process-live-p neo-term--process))
+      (when (and (derived-mode-p 'neo-term-mode)
+                 (process-live-p neo-term--process))
         (let ((size (neo-term--size window)))
           (unless (equal size neo-term--requested-size)
             (setq neo-term--requested-size size)
-            (neo-term--send (format "R%s,%s" (car size) (cdr size)))))))))
+            (neo-term--send (format "R%s,%s"
+                                    (car size)
+                                    (cdr size)))))))))
 (add-hook 'window-size-change-functions #'neo-term--resize)
+
+(defun neo-term--host-command (size)
+  (append
+   (list neo-term-host-program
+         "--backend"
+         (symbol-name neo-term-backend)
+         "--cols"
+         (number-to-string (car size))
+         "--rows"
+         (number-to-string (cdr size)))
+   (when neo-term-no-conpty '("--no-conpty"))
+   (list "--" neo-term-shell)
+   neo-term-shell-arguments))
+
+(defun neo-term--process-filter (process bytes)
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (condition-case failure
+          (neo-term--consume bytes)
+        (error
+         (setq neo-term--status "protocol error")
+         (message "neo-term: %s"
+                  (error-message-string failure))
+         (delete-process process))))))
+
+(defun neo-term--process-sentinel (process event)
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (unless (string-prefix-p "exit " neo-term--status)
+        (setq neo-term--status (string-trim event)))
+      (force-mode-line-update))))
 
 ;;;###autoload
 (defun neo-term ()
   "Start a Windows terminal in a new buffer and return that buffer."
   (interactive)
-  (unless (eq system-type 'windows-nt) (user-error "neo-term requires Windows"))
-  (unless (file-executable-p neo-term-host-program) (user-error "Build the neo-term helper with build.ps1 first"))
+  (unless (eq system-type 'windows-nt)
+    (user-error "neo-term requires Windows"))
+  (unless (file-executable-p neo-term-host-program)
+    (user-error "Build the neo-term helper with build.ps1 first"))
   (let* ((buffer (generate-new-buffer "*neo-term*"))
          (size (neo-term--size (selected-window)))
          (directory default-directory))
     (with-current-buffer buffer
       (neo-term-mode)
-      (setq default-directory directory neo-term--requested-size size)
+      (setq default-directory directory
+            neo-term--requested-size size)
       (condition-case error
           (setq neo-term--process
-                (make-process :name (buffer-name buffer) :buffer buffer :noquery t
-                              :connection-type 'pipe :coding 'binary
-                              :command (append (list neo-term-host-program "--backend" (symbol-name neo-term-backend)
-                                                     "--cols" (number-to-string (car size)) "--rows" (number-to-string (cdr size)))
-                                               (when neo-term-no-conpty '("--no-conpty"))
-                                               (list "--" neo-term-shell) neo-term-shell-arguments)
-                              :filter (lambda (process bytes)
-                                        (when (buffer-live-p (process-buffer process))
-                                          (with-current-buffer (process-buffer process)
-                                            (condition-case error (neo-term--consume bytes)
-                                              (error (setq neo-term--status "protocol error")
-                                                     (message "neo-term: %s" (error-message-string error))
-                                                     (delete-process process))))))
-                              :sentinel (lambda (process event)
-                                          (when (buffer-live-p (process-buffer process))
-                                            (with-current-buffer (process-buffer process)
-                                              (unless (string-prefix-p "exit " neo-term--status)
-                                                (setq neo-term--status (string-trim event)))
-                                              (force-mode-line-update))))))
-        (error (kill-buffer buffer) (signal (car error) (cdr error)))))
+                (make-process
+                 :name (buffer-name buffer)
+                 :buffer buffer
+                 :noquery t
+                 :connection-type 'pipe
+                 :coding 'binary
+                 :command (neo-term--host-command size)
+                 :filter #'neo-term--process-filter
+                 :sentinel #'neo-term--process-sentinel))
+        (error (kill-buffer buffer)
+               (signal (car error)
+                       (cdr error)))))
     (pop-to-buffer buffer)
     buffer))
 

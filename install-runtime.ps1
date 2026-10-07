@@ -21,8 +21,14 @@ try {
     }
     foreach ($entry in $files.GetEnumerator()) {
         $source = $archive.GetEntry($entry.Key)
-        if (-not $source) { throw "Missing ConPTY package file: $($entry.Key)" }
-        [IO.Compression.ZipFileExtensions]::ExtractToFile($source, (Join-Path $destination $entry.Value), $true)
+        if (-not $source) {
+            throw "Missing ConPTY package file: $($entry.Key)"
+        }
+
+        $destinationPath = Join-Path $destination $entry.Value
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($source, $destinationPath, $true)
     }
-} finally { $archive.Dispose() }
+} finally {
+    $archive.Dispose()
+}
 Write-Output "CONPTY_RUNTIME=$version ($destination)"
