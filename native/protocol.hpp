@@ -128,7 +128,7 @@ inline Command parse_command(const std::string& payload) {
         wide(result.text);
         return result;
     }
-    if (result.type == 'C' && result.text.empty()) {
+    if ((result.type == 'C' || result.type == 'L' || result.type == 'H') && result.text.empty()) {
         return result;
     }
     if (result.type != 'R' && result.type != 'K' && result.type != 'U') {

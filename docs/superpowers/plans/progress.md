@@ -28,3 +28,10 @@ Final: Ruling: Windows旧ビルドとEmacs29は最低要件として記載し未
 Final verification: test.ps1 -Gui → native PASS、host 12/12、ERT 7/7、byte compile警告なし、GUI Unicodeピクセル幅/TUI/3バックエンド PASS。git diff --check成功。Deferred minors: none。
 Task 3: complete (tests: test.ps1 -Gui → 12/12 host, 7/7 ERT, native/bytecompile/GUI PASS)
 Finish: 新規独立リポジトリで分岐元・remoteがないため、既存ブランチへのmergeや公開は行わずdevelopmentを保持。ユーザーの「どんどん進めていって」に従い不要な統合確認で停止しない。
+
+Follow-up readability: ユーザーの順序指定に従い、コード全体の改行・インデント・関数抽出を先に完了。commit 0e3e047。既存のnative/host12/ERT7/bytecompile/GUI検証を維持。
+Follow-up mode RED: 表示編集、Delete、C-cプレフィックス、履歴消去の追加ERT5件が失敗。矢印などの特殊キーはEmacsコマンドへ解決され、ASCII EnterもCtrl+Mとして送られることを追加テストで再現。
+Follow-up mode: 既存のneo-term-modeを強化。表示文字の読み取り専用属性と変更フック、コマンド終了時・描画時の再保護。C-cを端末操作プレフィックス、C-x C-qをコピー切り替えに変更。特殊キーと修飾キーは明示的にCLIへ送信。
+Follow-up clear: LはWin32の画面消去、Hは履歴消去。ConPTYはCLIコンソールへ一時接続して消去し、シェル文字列は送らない。Hの完了はscreen.history_clearedで通知して、先行する履歴フレームとの順序を保つ。
+Follow-up review: 独立レビューで変更フックの例外による解除を確認。コマンド終了時・描画時の再登録を追加して解決。履歴が溜まった状態の統合テストも追加。他のImportantなし。
+Follow-up verification: build.ps1 -Test と test.ps1 -Gui → native PASS、host15/15、ERT16/16、警告なしbytecompile、3バックエンドGUI PASS。cmd/PowerShellで入力途中の文字列を保持したクリアも確認。clang-format/Black/git diff --check通過。

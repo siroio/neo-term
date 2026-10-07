@@ -79,7 +79,7 @@ public:
                             ",\"y\":" + std::to_string(screen.y) +
                             ",\"visible\":" + (screen.visible ? "true" : "false") +
                             ",\"alt\":" + (screen.alt ? "true" : "false");
-        if (!changed && cursor == cursor_ && screen.history.empty()) {
+        if (!changed && cursor == cursor_ && screen.history.empty() && !screen.history_cleared) {
             return {};
         }
         cursor_ = cursor;
@@ -94,7 +94,8 @@ public:
         return "{\"type\":\"screen\",\"v\":1,\"generation\":" + std::to_string(++generation_) +
                ",\"cols\":" + std::to_string(screen.cols) +
                ",\"height\":" + std::to_string(screen.rows) + ',' + cursor + ",\"rows\":" + rows +
-               ",\"history\":" + history + '}';
+               ",\"history\":" + history +
+               ",\"history_cleared\":" + (screen.history_cleared ? "true" : "false") + '}';
     }
 };
 }

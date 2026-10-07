@@ -91,6 +91,8 @@ class Session:
                 for row in event["rows"]:
                     self.rows[row[0]] = row[1]
                 self.screen = event
+                if event.get("history_cleared"):
+                    self.history.clear()
                 self.history.extend(event.get("history", []))
             if event["type"] == "error":
                 raise AssertionError(event)
@@ -165,6 +167,67 @@ class HostSpecifications(unittest.TestCase):
     def test_conpty_prohibition_selects_classic(self):
         session, ready = self.run_session("auto", [FIXTURE, "unicode"], ["--no-conpty"])
         self.assertEqual(ready["backend"], "classic")
+
+    def test_screen_clear_preserves_the_cli_and_accepts_further_input(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, ready = self.run_session(backend, [FIXTURE, "interactive"])
+                session.until(lambda e: "FIXTURE_READY" in session.text())
+                session.send("L")
+                session.until(lambda e: e["type"] == "screen" and not session.text().strip())
+                self.assertIsNone(session.process.poll())
+                self.assertGreater(ready["pid"], 0)
+                session.send("Tz")
+                session.until(lambda e: "CHAR=122" in session.text())
+                session.send("H")
+                session.until(lambda e: e.get("history_cleared") is True)
+                self.assertIn("CHAR=122", session.text())
+
+    def test_cmd_and_powershell_continue_after_native_and_shell_clear(self):
+        programs = (("cmd.exe", "/Q"), ("powershell.exe", "-NoLogo", "-NoProfile"))
+        for backend in BACKENDS:
+            for program in programs:
+                with self.subTest(backend=backend, program=program[0]):
+                    session, _ = self.run_session(backend, program)
+                    session.until(lambda e: e["type"] == "screen" and ">" in session.text())
+                    session.send("L")
+                    session.until(lambda e: e["type"] == "screen" and not session.text().strip())
+                    session.send("Tcls")
+                    session.send("K1,0")
+                    session.until(lambda e: e["type"] == "screen" and ">" in session.text())
+                    session.send(
+                        "Techo CLEAR^_SHELL_OK"
+                        if program[0] == "cmd.exe"
+                        else "T'CLEAR_' + 'SHELL_OK'"
+                    )
+                    session.send("K1,0")
+                    session.until(lambda e: "CLEAR_SHELL_OK" in session.text())
+                    session.send("Techo PENDING^_" if program[0] == "cmd.exe" else "T'PENDING_' + ")
+                    session.until(lambda e: "PENDING" in session.text())
+                    session.send("L")
+                    session.until(lambda e: e["type"] == "screen" and not session.text().strip())
+                    session.send("TSHELL_OK" if program[0] == "cmd.exe" else "T'SHELL_OK'")
+                    session.send("K1,0")
+                    session.until(lambda e: "PENDING_SHELL_OK" in session.text())
+
+    def test_populated_scrollback_survives_screen_clear_until_history_clear(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "history"])
+                session.until(lambda e: "FIXTURE_READY" in session.text())
+                expected_history = 302 - session.screen["height"]
+                if len(session.history) < expected_history:
+                    session.until(lambda e: len(session.history) == expected_history)
+                self.assertEqual(len(session.history), expected_history)
+                previous = session.history.copy()
+                session.send("L")
+                session.until(lambda e: e["type"] == "screen" and not session.text().strip())
+                self.assertEqual(session.history, previous)
+                session.send("H")
+                session.until(lambda e: e.get("history_cleared") is True)
+                self.assertEqual(session.history, [])
+                session.send("Tz")
+                session.until(lambda e: "CHAR=122" in session.text())
 
     def test_pipe_disconnect_releases_owned_processes(self):
         for backend in BACKENDS:

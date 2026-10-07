@@ -60,6 +60,12 @@
   (should (equal (neo-term--key-command 'C-left) "K7,4"))
   (should (equal (neo-term--key-command 'return) "K1,0")))
 
+(ert-deftest neo-term-ascii-terminal-keys-and-backtab-preserve-key-identity ()
+  (should (equal (neo-term--key-command ?\r) "K1,0"))
+  (should (equal (neo-term--key-command ?\t) "K2,0"))
+  (should (equal (neo-term--key-command ?\e) "K4,0"))
+  (should (equal (neo-term--key-command 'backtab) "K2,1")))
+
 (ert-deftest neo-term-native-cell-width-overrides-emacs-unicode-width ()
   (let ((original (char-width #x1fae0)))
     (with-temp-buffer
@@ -125,3 +131,123 @@
                                     (buffer-string)))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
+
+(defun neo-term-test-screen ()
+  (neo-term--screen
+   '((type . "screen") (v . 1) (cols . 2) (height . 2)
+     (x . 1) (y . 0) (visible . t) (alt . nil)
+     (rows . [[0 [["X" 1 -1 -1 0] [" " 1 -1 -1 0]]]
+              [1 [[" " 1 -1 -1 0] [" " 1 -1 -1 0]]]])
+     (history . ["old"]))))
+
+(ert-deftest neo-term-display-cannot-be-edited-after-read-only-is-disabled ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (read-only-mode -1)
+    (let ((before (buffer-string)))
+      (should-error (insert "local edit"))
+      (read-only-mode -1)
+      (should-error (delete-region (point-min) (point-max)))
+      (should (equal before (buffer-string))))
+    (neo-term-test-screen)
+    (should buffer-read-only)))
+
+(ert-deftest neo-term-command-loop-restores-protection-after-a-rejected-edit ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (dotimes (_ 2)
+      (read-only-mode -1)
+      (should-error (insert "local edit"))
+      (run-hooks 'post-command-hook)
+      (should buffer-read-only)
+      (should (memq #'neo-term--protect-display before-change-functions)))
+    (should (string-empty-p (buffer-string)))))
+
+(ert-deftest neo-term-editing-keys-send-input-without-changing-the-display ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (let ((before (buffer-string)) sent)
+      (cl-letf (((symbol-function 'neo-term--send)
+                 (lambda (command) (push command sent))))
+        (let ((last-command-event 'backspace))
+          (call-interactively (key-binding [backspace])))
+        (let ((last-command-event 'delete))
+          (call-interactively (key-binding [delete])))
+        (should (equal (reverse sent) '("K3,0" "K10,0")))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest neo-term-typing-with-a-selection-does-not-delete-terminal-output ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (delete-selection-mode 1)
+    (unwind-protect
+        (let ((before (buffer-string))
+              (transient-mark-mode t)
+              (last-command-event ?a)
+              (this-command 'neo-term-send-key)
+              sent)
+          (goto-char (point-min))
+          (push-mark (point-max) t t)
+          (cl-letf (((symbol-function 'neo-term--send)
+                     (lambda (command) (setq sent command))))
+            (delete-selection-pre-hook)
+            (call-interactively (key-binding "a")))
+          (should (equal sent "Ta"))
+          (should (equal before (buffer-string))))
+      (delete-selection-mode -1))))
+
+(ert-deftest neo-term-terminal-prefix-reserves-clear-copy-and-interrupt ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (should (eq (key-binding (kbd "C-c C-c")) #'neo-term-interrupt))
+    (should (eq (key-binding (kbd "C-c C-l")) #'neo-term-clear))
+    (should (eq (key-binding (kbd "C-l")) #'neo-term-clear))
+    (should (eq (key-binding (kbd "C-c M-l")) #'neo-term-clear-scrollback))
+    (should (eq (key-binding (kbd "C-x C-q")) #'neo-term-copy-mode))
+    (call-interactively (key-binding (kbd "C-x C-q")))
+    (should neo-term--copy)
+    (should buffer-read-only)))
+
+(ert-deftest neo-term-special-keys-and-modifiers-reach-the-cli ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (dolist (key '(left right up down home end prior next return tab backtab escape insert
+                       backspace delete deletechar f1 f12 f24))
+      (dolist (modifiers '(nil (control) (meta) (shift) (control shift)
+                              (control meta) (meta shift) (control meta shift)))
+        (let ((event (event-convert-list (append modifiers (list key)))) sent)
+          (if (eq event 'S-insert)
+              (should (eq (key-binding (vector event)) #'neo-term-paste))
+            (cl-letf (((symbol-function 'neo-term--send)
+                       (lambda (command) (setq sent command))))
+              (let ((last-command-event event))
+                (call-interactively (key-binding (vector event)))))
+            (should (equal sent (neo-term--key-command event)))))))))
+
+(ert-deftest neo-term-clear-requests-do-not-inject-shell-commands ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (neo-term-copy-mode)
+    (let (sent)
+      (cl-letf (((symbol-function 'neo-term--send)
+                 (lambda (command) (push command sent))))
+        (neo-term-clear)
+        (should-not neo-term--copy)
+        (neo-term-clear-scrollback)
+        (neo-term-interrupt)
+        (should (equal (reverse sent) '("L" "H" "U99,4")))))))
+
+(ert-deftest neo-term-history-clear-acknowledgment-retains-the-current-screen ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (neo-term--screen
+     '((type . "screen") (v . 1) (cols . 2) (height . 2)
+       (x . 1) (y . 0) (visible . t) (alt . nil)
+       (rows . []) (history . []) (history_cleared . t)))
+    (should-not neo-term--history)
+    (should (string-prefix-p "X " (buffer-string)))))

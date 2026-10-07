@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <sstream>
+#include <utility>
 
 namespace neo {
 inline void wincheck(bool success, const char* operation) {
@@ -66,6 +67,19 @@ inline std::wstring executable_path() {
     return result;
 }
 
+inline void clear_console(HANDLE output) {
+    CONSOLE_SCREEN_BUFFER_INFO information{};
+    wincheck(GetConsoleScreenBufferInfo(output, &information), "GetConsoleScreenBufferInfo");
+    const DWORD cells = static_cast<DWORD>(information.dwSize.X) * information.dwSize.Y;
+    const COORD origin{0, 0};
+    DWORD written = 0;
+    wincheck(FillConsoleOutputCharacterW(output, L' ', cells, origin, &written),
+             "FillConsoleOutputCharacterW");
+    wincheck(FillConsoleOutputAttribute(output, information.wAttributes, cells, origin, &written),
+             "FillConsoleOutputAttribute");
+    wincheck(SetConsoleCursorPosition(output, origin), "SetConsoleCursorPosition");
+}
+
 inline std::wstring resolve_program(const std::wstring& program) {
     std::wstring path(32768, L'\0');
     const auto length = SearchPathW(
@@ -114,6 +128,7 @@ struct Screen {
     int y = 0;
     bool visible = true;
     bool alt = false;
+    bool history_cleared = false;
     std::vector<std::vector<Cell>> lines;
     std::vector<std::string> history;
 };

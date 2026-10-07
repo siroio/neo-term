@@ -59,7 +59,7 @@
                                      (string-match-p "FIXTURE_READY"
                                                      (buffer-string))))
                 (neo-term--send "T日")
-                (neo-term--send "K5,0")
+                (execute-kbd-macro (kbd "<up>"))
                 (neo-term-gui-wait (lambda ()
                                      (and (string-match-p "CHAR=26085"
                                                           (buffer-string))
@@ -71,13 +71,36 @@
                                   (frame-height))
                   (neo-term-gui-wait (lambda ()
                                        (/= previous neo-term--cols))))
-                (neo-term--send "U99,4")
+                (execute-kbd-macro (kbd "<backspace> <delete>"))
+                (neo-term-gui-wait
+                 (lambda ()
+                   (and (string-match-p "KEY=8 " (buffer-string))
+                        (string-match-p "KEY=46 " (buffer-string)))))
+                (execute-kbd-macro (kbd "RET TAB <backtab>"))
+                (neo-term-gui-wait
+                 (lambda ()
+                   (and (string-match-p "KEY=13 CHAR=13" (buffer-string))
+                        (string-match-p "KEY=9 CHAR=9" (buffer-string)))))
+                (execute-kbd-macro (kbd "C-c C-c"))
                 (neo-term-gui-wait (lambda ()
                                      (string-match-p "INTERRUPTED"
                                                      (buffer-string))))
-                (neo-term-copy-mode)
+                (execute-kbd-macro (kbd "C-x C-q"))
                 (unless neo-term--copy (error "Copy mode did not activate"))
-                (neo-term-copy-mode)
+                (unless buffer-read-only (error "Copy mode made the display writable"))
+                (condition-case nil
+                    (progn
+                      (let ((inhibit-read-only t))
+                        (delete-region (point-min) (point-max)))
+                      (error "Terminal display was editable"))
+                  (user-error nil))
+                (execute-kbd-macro (kbd "C-c C-l"))
+                (when neo-term--copy (error "Clear did not resume input mode"))
+                (neo-term-gui-wait
+                 (lambda () (string-empty-p (string-trim (buffer-string)))))
+                (execute-kbd-macro "z")
+                (neo-term-gui-wait
+                 (lambda () (string-match-p "CHAR=122" (buffer-string))))
                 (redisplay t))
             (when (buffer-live-p buffer)
               (kill-buffer buffer)))))
@@ -107,7 +130,7 @@
                 (kill-buffer buffer))))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
         (insert
-         "GUI_TESTS=PASS (installed backends; input, resize, interrupt, copy; ConPTY TUI/truecolor/alternate screen; Unicode pixel width)\n"))
+         "GUI_TESTS=PASS (installed backends; input, resize, interrupt, protected copy, Backspace/Delete, clear and continued input; ConPTY TUI/truecolor/alternate screen; Unicode pixel width)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

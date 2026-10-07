@@ -26,6 +26,7 @@ class Conpty final : public Backend {
     std::atomic<bool> stopping_{false};
     std::string failure_;
     bool visible_ = true, alt_ = false;
+    bool history_cleared_ = false;
     std::vector<unsigned char> attributes_;
 
     static void output_callback(const char* bytes, size_t length, void* user) {
@@ -252,6 +253,26 @@ public:
     }
 
     void command(const Command& value) override {
+        if (value.type == 'L') {
+            FreeConsole();
+            wincheck(AttachConsole(pid()), "AttachConsole for screen clear");
+            try {
+                Handle output(CreateFileW(L"CONOUT$",
+                                          GENERIC_READ | GENERIC_WRITE,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          nullptr,
+                                          OPEN_EXISTING,
+                                          0,
+                                          nullptr));
+                wincheck(output.get() != INVALID_HANDLE_VALUE, "Open console for screen clear");
+                clear_console(output.get());
+            } catch (...) {
+                FreeConsole();
+                throw;
+            }
+            FreeConsole();
+            return;
+        }
         if (value.type == 'R') {
             const auto result = resize_(
                 console_, {static_cast<SHORT>(value.first), static_cast<SHORT>(value.second)});
@@ -263,7 +284,10 @@ public:
             return;
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (value.type == 'K') {
+        if (value.type == 'H') {
+            history_.clear();
+            history_cleared_ = true;
+        } else if (value.type == 'K') {
             vterm_keyboard_key(terminal_,
                                static_cast<VTermKey>(value.first),
                                static_cast<VTermModifier>(value.second));
@@ -290,6 +314,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
         Screen result;
+        result.history_cleared = std::exchange(history_cleared_, false);
         vterm_get_size(terminal_, &result.rows, &result.cols);
         VTermPos cursor;
         vterm_state_get_cursorpos(vterm_obtain_state(terminal_), &cursor);

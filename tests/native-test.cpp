@@ -45,6 +45,15 @@ int main() {
     }
     require(rejected, "oversized frames are rejected before allocation");
     require(parse_command("R80,24").first == 80, "resize preserves requested columns");
+    require(parse_command("L").type == 'L', "screen clear has no shell text");
+    require(parse_command("H").type == 'H', "history clear is independent from screen clear");
+    rejected = false;
+    try {
+        parse_command("Lcls");
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    require(rejected, "clear commands reject unexpected payloads");
     rejected = false;
     try {
         parse_command("R0,24");

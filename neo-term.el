@@ -42,6 +42,7 @@
 (defvar-local neo-term--visible t)
 (defvar-local neo-term--alt nil)
 (defvar-local neo-term--copy nil)
+(defvar-local neo-term--updating nil)
 (defvar-local neo-term--timer nil)
 (defvar-local neo-term--requested-size nil)
 (defvar-local neo-term--status "starting")
@@ -149,6 +150,8 @@
       (error "Terminal cell widths do not match columns"))))
 
 (defun neo-term--screen (event)
+  (when (alist-get 'history_cleared event)
+    (setq neo-term--history nil))
   (let ((cols (alist-get 'cols event))
         (height (alist-get 'height event))
         (x (alist-get 'x event))
@@ -256,6 +259,7 @@
 
 (defun neo-term--render ()
   (let ((inhibit-read-only t)
+        (neo-term--updating t)
         (cursor-position nil)
         (screen-start nil))
     (erase-buffer)
@@ -285,7 +289,19 @@
     (dolist (window (get-buffer-window-list (current-buffer) nil t))
       (set-window-start window screen-start t)
       (set-window-point window (point)))
+    (neo-term--restore-display-protection)
+    (add-text-properties (point-min) (point-max)
+                         '(read-only t front-sticky (read-only)))
     (set-buffer-modified-p nil)))
+
+(defun neo-term--protect-display (_begin _end)
+  (unless neo-term--updating
+    (setq buffer-read-only t)
+    (user-error "Terminal display cannot be edited; use copy mode to select text")))
+
+(defun neo-term--restore-display-protection ()
+  (setq buffer-read-only t)
+  (add-hook 'before-change-functions #'neo-term--protect-display nil t))
 
 (defun neo-term--insert-cell (cell)
   (let ((text (aref cell 0))
@@ -305,6 +321,7 @@
                   (if (memq 'control modifiers) 4 0)))
          (key (cdr (assq basic '((return . 1)
                                  (tab . 2)
+                                 (backtab . 2)
                                  (backspace . 3)
                                  (escape . 4)
                                  (up . 5)
@@ -313,10 +330,16 @@
                                  (right . 8)
                                  (insert . 9)
                                  (delete . 10)
+                                 (deletechar . 10)
                                  (home . 11)
                                  (end . 12)
                                  (prior . 13)
                                  (next . 14))))))
+    (when (memq event '(13 9 27))
+      (setq basic event
+            bits (logand bits 3)))
+    (when (eq basic 'backtab)
+      (setq bits (logior bits 1)))
     (when (and (symbolp basic)
                (string-match "\\`f\\([0-9]+\\)\\'"
                              (symbol-name basic)))
@@ -342,6 +365,39 @@
   "Send the current key to the terminal."
   (interactive)
   (neo-term--send (neo-term--key-command last-command-event)))
+
+(defun neo-term--resume-input ()
+  (when neo-term--copy
+    (neo-term-copy-mode)))
+
+(defun neo-term-send-backspace ()
+  "Send Backspace to the CLI."
+  (interactive)
+  (neo-term--send "K3,0"))
+
+(defun neo-term-send-delete ()
+  "Send Delete to the CLI."
+  (interactive)
+  (neo-term--send "K10,0"))
+
+(defun neo-term-interrupt ()
+  "Send Ctrl+C to the CLI."
+  (interactive)
+  (neo-term--resume-input)
+  (neo-term--send "U99,4"))
+
+(defun neo-term-clear ()
+  "Clear the console screen while keeping the CLI and scrollback."
+  (interactive)
+  (neo-term--resume-input)
+  (neo-term--send "L"))
+
+(defun neo-term-clear-scrollback ()
+  "Clear scrollback while keeping the current console screen."
+  (interactive)
+  (neo-term--resume-input)
+  (neo-term--send "H"))
+
 (defun neo-term-send-next-key ()
   "Read and send a key, including reserved Emacs keys."
   (interactive)
@@ -349,11 +405,13 @@
 (defun neo-term-paste (text)
   "Paste TEXT into the terminal."
   (interactive (list (current-kill 0)))
+  (neo-term--resume-input)
   (neo-term--send (concat "P" text)))
 (defun neo-term-copy-mode ()
   "Toggle selection and history browsing."
   (interactive)
   (setq neo-term--copy (not neo-term--copy))
+  (setq buffer-read-only t)
   (use-local-map (if neo-term--copy neo-term-copy-mode-map neo-term-mode-map))
   (if neo-term--copy (setq cursor-type 'bar)
     (neo-term--render))
@@ -373,6 +431,17 @@
                        (alist-get 'attempts neo-term--session))
              neo-term--status)))
 
+(defvar neo-term-command-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c") #'neo-term-interrupt)
+    (define-key map (kbd "C-l") #'neo-term-clear)
+    (define-key map (kbd "M-l") #'neo-term-clear-scrollback)
+    (define-key map (kbd "C-t") #'neo-term-copy-mode)
+    (define-key map (kbd "C-v") #'neo-term-paste)
+    (define-key map (kbd "C-k") #'neo-term-close)
+    (define-key map (kbd "C-d") #'neo-term-describe-session)
+    map))
+
 (defvar neo-term-mode-map
   (let ((map (make-keymap))
         (prefix (make-sparse-keymap)))
@@ -382,7 +451,26 @@
     (define-key prefix (kbd "C-t") #'neo-term-copy-mode)
     (define-key prefix (kbd "C-k") #'neo-term-close)
     (define-key prefix (kbd "C-d") #'neo-term-describe-session)
+    (define-key prefix (kbd "C-q") #'neo-term-copy-mode)
     (define-key map (kbd "C-x") prefix)
+    (define-key map (kbd "C-c") neo-term-command-map)
+    (define-key map (kbd "C-l") #'neo-term-clear)
+    (define-key map (kbd "DEL") #'neo-term-send-backspace)
+    (dolist (key (append '(return tab backtab backspace escape up down left right insert
+                                delete deletechar home end prior next)
+                        (cl-loop for number from 1 to 24
+                                 collect (intern (format "f%s" number)))))
+      (dolist (modifiers '(nil (shift) (meta) (control) (shift meta)
+                              (shift control) (meta control) (shift meta control)))
+        (define-key map (vector (event-convert-list (append modifiers (list key))))
+                    #'neo-term-send-key)))
+    (define-key map [remap self-insert-command] #'neo-term-send-key)
+    (define-key map [remap delete-backward-char] #'neo-term-send-backspace)
+    (define-key map [remap backward-delete-char-untabify] #'neo-term-send-backspace)
+    (define-key map [remap delete-char] #'neo-term-send-delete)
+    (define-key map [remap read-only-mode] #'neo-term-copy-mode)
+    (define-key map [down-mouse-1] #'mouse-drag-region)
+    (define-key map [mouse-1] #'mouse-set-point)
     (define-key map (kbd "C-g") #'keyboard-quit)
     (define-key map (kbd "C-q") #'neo-term-send-next-key)
     (define-key map (kbd "C-y") #'neo-term-paste)
@@ -392,6 +480,10 @@
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "C-x C-t") #'neo-term-copy-mode)
+    (define-key map (kbd "C-x C-q") #'neo-term-copy-mode)
+    (define-key map [remap read-only-mode] #'neo-term-copy-mode)
+    (define-key map (kbd "C-c") neo-term-command-map)
+    (define-key map (kbd "M-w") #'kill-ring-save)
     (define-key map "q" #'neo-term-copy-mode)
     map))
 
@@ -403,7 +495,7 @@
     (delete-process neo-term--process)))
 
 (define-derived-mode neo-term-mode special-mode "Neo-Term"
-  "Windows terminal. C-x C-t toggles copy mode; C-q sends a reserved key."
+  "Windows terminal. C-c is the terminal command prefix; C-q sends a reserved key."
   (setq-local truncate-lines t)
   (setq-local buffer-undo-list t)
   (setq-local scroll-margin 0)
@@ -416,6 +508,8 @@
                                                                                " copy" ""))))
   (setq-local buffer-face-mode-face 'fixed-pitch)
   (buffer-face-mode 1)
+  (neo-term--restore-display-protection)
+  (add-hook 'post-command-hook #'neo-term--restore-display-protection nil t)
   (add-hook 'kill-buffer-hook #'neo-term--cleanup nil t))
 
 (defun neo-term--size (window)

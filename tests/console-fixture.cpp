@@ -91,6 +91,11 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),
                    (input_mode | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT) &
                        ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+    if (mode == L"history") {
+        for (int index = 0; index < 300; ++index) {
+            print(L"history " + std::to_wstring(index) + L"\r\n");
+        }
+    }
     print(L"FIXTURE_READY\r\n");
     INPUT_RECORD event;
     DWORD count;
