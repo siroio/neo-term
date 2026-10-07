@@ -2,3 +2,4 @@ build/
 var/
 *.elc
 vendor/*.tar.gz
+__pycache__/
