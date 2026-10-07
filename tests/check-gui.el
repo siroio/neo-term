@@ -11,6 +11,25 @@
 (condition-case failure
     (progn
       (unless (display-graphic-p) (error "GUI Emacs is required"))
+      (let ((buffer (generate-new-buffer "*neo-term-width-check*")))
+        (unwind-protect
+            (progn
+              (pop-to-buffer buffer)
+              (neo-term-mode)
+              (neo-term--screen '((type . "screen") (v . 1) (generation . 1) (cols . 2) (height . 2)
+                                 (x . 1) (y . 0) (visible . t) (alt . nil)
+                                 (rows . [[0 [["🫠" 1 -1 -1 0] ["A" 1 -1 -1 0]]]
+                                          [1 [[" " 1 -1 -1 0] [" " 1 -1 -1 0]]]]) (history . [])))
+              (neo-term--render)
+              (unless (string-prefix-p "🫠A" (buffer-substring-no-properties (point-min) (point-max)))
+                (error "Width correction altered copyable Unicode text"))
+              (redisplay t)
+              (let* ((origin (car (posn-x-y (posn-at-point 1))))
+                     (after (car (posn-x-y (posn-at-point 2))))
+                     (cell-width (frame-char-width)))
+                (unless (<= (abs (- (- after origin) cell-width)) 1)
+                  (error "GUI native width mismatch: %s versus %s" (- after origin) cell-width))))
+          (kill-buffer buffer)))
       (dolist (backend (append '(system-conpty classic)
                                (when (file-exists-p (expand-file-name "build/runtime/conpty.dll" neo-term-gui-root)) '(bundled-conpty))))
         (let* ((neo-term-backend backend)
@@ -34,8 +53,25 @@
                 (neo-term-copy-mode)
                 (redisplay t))
             (when (buffer-live-p buffer) (kill-buffer buffer)))))
+      (dolist (backend '(system-conpty bundled-conpty))
+        (when (or (eq backend 'system-conpty)
+                  (file-exists-p (expand-file-name "build/runtime/conpty.dll" neo-term-gui-root)))
+          (let* ((neo-term-backend backend)
+                 (neo-term-shell (expand-file-name "build/console-fixture.exe" neo-term-gui-root))
+                 (neo-term-shell-arguments '("vt"))
+                 (buffer (neo-term)))
+            (unwind-protect
+                (with-current-buffer buffer
+                  (neo-term-gui-wait (lambda () (and neo-term--alt (string-match-p "ALT_SCREEN" (buffer-string)))))
+                  (goto-char (point-min))
+                  (search-forward "ALT_SCREEN")
+                  (unless (equal (plist-get (get-text-property (1- (point)) 'face) :foreground) "#12ab34")
+                    (error "GUI TUI truecolor was lost"))
+                  (redisplay t)
+                  (neo-term-gui-wait (lambda () (and (not neo-term--alt) (string-match-p "BURST_DONE" (buffer-string))))))
+              (when (buffer-live-p buffer) (kill-buffer buffer))))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
-        (insert "GUI_TESTS=PASS (installed backends; input, resize, interrupt, copy)\n"))
+        (insert "GUI_TESTS=PASS (installed backends; input, resize, interrupt, copy; ConPTY TUI/truecolor/alternate screen; Unicode pixel width)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

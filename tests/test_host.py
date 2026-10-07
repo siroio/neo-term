@@ -9,6 +9,8 @@ import time
 import unittest
 import ctypes
 import re
+import tempfile
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = ROOT / 'build' / 'neo-term-host.exe'
@@ -21,8 +23,8 @@ KERNEL.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 KERNEL.CloseHandle.argtypes = [ctypes.c_void_p]
 
 class Session:
-    def __init__(self, backend, program, extra=()):
-        self.process = subprocess.Popen([str(HOST), '--backend', backend, *extra, '--', *map(str, program)],
+    def __init__(self, backend, program, extra=(), host=HOST):
+        self.process = subprocess.Popen([str(host), '--backend', backend, *extra, '--', *map(str, program)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         creationflags=subprocess.CREATE_NO_WINDOW)
         self.events = queue.Queue()
@@ -170,10 +172,58 @@ class HostSpecifications(unittest.TestCase):
                 finally:
                     KERNEL.CloseHandle(handle)
 
+    def test_close_releases_helper_when_screen_output_is_not_read(self):
+        for backend in BACKENDS:
+            for delay in (.002, .01):
+                with self.subTest(backend=backend, delay=delay):
+                    cols, rows = ('80', '24') if backend == 'classic' else ('300', '200')
+                    process = subprocess.Popen([str(HOST), '--backend', backend, '--cols', cols, '--rows', rows,
+                                                '--', str(FIXTURE), 'sleeper'], stdin=subprocess.PIPE,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                               creationflags=subprocess.CREATE_NO_WINDOW)
+                    try:
+                        length, = struct.unpack('<I', process.stdout.read(4))
+                        ready = json.loads(process.stdout.read(length))
+                        self.assertEqual(ready['type'], 'ready')
+                        time.sleep(delay)
+                        process.stdin.write(struct.pack('<I', 1) + b'C')
+                        process.stdin.flush()
+                        self.assertEqual(process.wait(timeout=3), 0)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            stream.close()
+
     def test_auto_prefers_bundled_runtime_when_installed(self):
         session, ready = self.run_session('auto', [FIXTURE, 'unicode'])
         expected = 'bundled-conpty' if 'bundled-conpty' in BACKENDS else 'system-conpty'
         self.assertEqual(ready['backend'], expected)
+
+    def test_missing_bundled_runtime_falls_back_before_cli_launch(self):
+        with tempfile.TemporaryDirectory(prefix='日本語 helper ', dir=HOST.parent) as directory:
+            helper = Path(directory) / 'host.exe'
+            shutil.copy2(HOST, helper)
+            session = Session('auto', [FIXTURE, 'unicode'], host=helper)
+            try:
+                ready = session.until(lambda e: e['type'] == 'ready')
+                self.assertEqual(ready['backend'], 'system-conpty')
+                self.assertEqual([attempt['backend'] for attempt in ready['attempts']], ['bundled-conpty'])
+                session.until(lambda e: e['type'] == 'exit')
+            finally:
+                session.close()
+
+    def test_unicode_executable_path_is_not_passed_through_a_shell(self):
+        with tempfile.TemporaryDirectory(prefix='日本語 cli ', dir=HOST.parent) as directory:
+            executable = Path(directory) / '検証 CLI.exe'
+            shutil.copy2(FIXTURE, executable)
+            for backend in BACKENDS:
+                with self.subTest(backend=backend):
+                    session, _ = self.run_session(backend, [executable, 'unicode'])
+                    session.until(lambda e: '日本語' in session.text())
+                    session.until(lambda e: e['type'] == 'exit')
+                    session.close()
 
     def test_real_cmd_and_powershell_are_interactive(self):
         for backend in BACKENDS:

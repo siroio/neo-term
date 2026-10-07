@@ -46,6 +46,18 @@
   (should (equal (neo-term--key-command 'C-left) "K7,4"))
   (should (equal (neo-term--key-command 'return) "K1,0")))
 
+(ert-deftest neo-term-native-cell-width-overrides-emacs-unicode-width ()
+  (let ((original (char-width #x1fae0)))
+    (with-temp-buffer
+      (neo-term-mode)
+      (neo-term--screen '((type . "screen") (v . 1) (generation . 1) (cols . 2) (height . 2)
+                         (x . 1) (y . 0) (visible . t) (alt . nil)
+                         (rows . [[0 [["🫠" 1 -1 -1 0] ["A" 1 -1 -1 0]]]
+                                  [1 [[" " 1 -1 -1 0] [" " 1 -1 -1 0]]]]) (history . [])))
+      (should (= (current-column) 1))
+      (should (= (string-width "🫠A") 2)))
+    (should (= (char-width #x1fae0) original))))
+
 (ert-deftest neo-term-output-history-is-copyable-and-bounded ()
   (should (fboundp 'neo-term--screen))
   (with-temp-buffer

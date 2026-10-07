@@ -16,3 +16,15 @@ Task 2: Ruling: classicの非BMP文字はWindowsが置換文字に変換する�
 Task 3 RED: ERT6件が未実装関数で失敗。GREEN: ERT6/6、警告をエラー扱いしたbyte compile成功。
 Task 2 GREEN: 同梱ConPTY 1.25.260930003・system・classicでCLI統合テスト9/9。通信断でCLI終了、閉鎖時の孫プロセス終了もハンドル待機で確認。
 Task 3 GREEN: test.ps1 -Gui → native PASS、host 9/9、ERT 6/6、byte compile警告なし、3バックエンドGUI PASS。
+Task 1: complete (commits 48e76b0..adef705, tests: build.ps1 -Test → NATIVE_TESTS=PASS)
+Task 2: complete (commits adef705..707f053, tests: Python unittest test_host → 9/9 PASS)
+Task 3: review pending (commit d7db366, tests: test.ps1 -Gui → native PASS / host 9/9 / ERT 6/6 / GUI PASS)
+Final review: fresh-context reviewer gpt-6-astra、Criticalなし、Important2件、Minorなし。
+Final: fixed 未読stdoutと終了要求の競合 — test_close_releases_helper_when_screen_output_is_not_read RED→GREEN、main/input双方を完了まで繰り返しキャンセルする。
+Final: fixed nativeセル幅とEmacs幅の不一致 — neo-term-native-cell-width-overrides-emacs-unicode-width RED→GREEN、GUIピクセル比較もRED→GREEN。バッファ固有の幅テーブルと必要時だけSVG表示を使い元の文字列を保持する。
+Final: Ruling: classicでの非BMP復元・完全履歴・代替画面識別は初版制限を維持 — APIが返さない情報の復元を約束しない — classicで絵文字や一部TUI・履歴が欠ける。
+Final: Ruling: マウス・画像プロトコル・シェル連携・カラー付き履歴は初版対象外を維持 — 文字端末の初期範囲を完成させる — 対応するアプリは一部機能を使えない。
+Final: Ruling: Windows旧ビルドとEmacs29は最低要件として記載し未検証と明示 — 実測済みのbuild26300/Emacs31.1だけを確認済みとする — 古い環境では追加修正が必要になる可能性がある。
+Final verification: test.ps1 -Gui → native PASS、host 12/12、ERT 7/7、byte compile警告なし、GUI Unicodeピクセル幅/TUI/3バックエンド PASS。git diff --check成功。Deferred minors: none。
+Task 3: complete (tests: test.ps1 -Gui → 12/12 host, 7/7 ERT, native/bytecompile/GUI PASS)
+Finish: 新規独立リポジトリで分岐元・remoteがないため、既存ブランチへのmergeや公開は行わずdevelopmentを保持。ユーザーの「どんどん進めていって」に従い不要な統合確認で停止しない。

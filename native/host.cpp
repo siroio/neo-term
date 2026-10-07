@@ -63,9 +63,19 @@ int wmain(int argc, wchar_t** argv) {
     std::unique_ptr<Backend> backend;
     std::thread commands;
     std::atomic<bool> stopping{false};
+    std::atomic<bool> main_done{false}, commands_done{false};
     std::mutex failure_mutex;
     std::string failure;
     bool ready_sent = false;
+    auto join_commands = [&] {
+        main_done = true;
+        if (!commands.joinable()) return;
+        while (!commands_done) {
+            CancelSynchronousIo(commands.native_handle());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        commands.join();
+    };
     try {
         std::vector<std::wstring> arguments;
         for (int index = 1; index < argc; ++index) arguments.emplace_back(argv[index]);
@@ -92,16 +102,22 @@ int wmain(int argc, wchar_t** argv) {
         commands = std::thread([&] {
             try {
                 char header[4];
-                while (read_exact(input, header, 4)) {
+                while (!main_done && read_exact(input, header, 4)) {
                     std::string payload(frame_length(header), '\0');
                     if (!read_exact(input, payload.data(), payload.size())) throw std::runtime_error("Missing input payload");
                     const auto value = parse_command(payload);
                     if (value.type == 'C') break;
                     backend->command(value);
                 }
-            } catch (const std::exception& error) { std::lock_guard<std::mutex> lock(failure_mutex); failure = error.what(); }
+            } catch (const std::exception& error) {
+                if (!main_done) { std::lock_guard<std::mutex> lock(failure_mutex); failure = error.what(); }
+            }
             stopping = true;
-            CancelSynchronousIo(main_thread.get());
+            while (!main_done) {
+                CancelSynchronousIo(main_thread.get());
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            commands_done = true;
         });
         ScreenEncoder encoder;
         int final_samples = 0;
@@ -112,16 +128,18 @@ int wmain(int argc, wchar_t** argv) {
             if (backend->exited() && ++final_samples >= 5) { finished = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        if (commands.joinable()) { CancelSynchronousIo(commands.native_handle()); commands.join(); }
+        if (finished && !stopping) send_frame(output, "{\"type\":\"exit\",\"v\":1,\"code\":" + std::to_string(backend->exit_code()) + '}');
+        join_commands();
         backend->stop();
         { std::lock_guard<std::mutex> lock(failure_mutex); if (!failure.empty()) throw std::runtime_error(failure); }
-        if (finished) send_frame(output, "{\"type\":\"exit\",\"v\":1,\"code\":" + std::to_string(backend->exit_code()) + '}');
         return 0;
     } catch (const std::exception& error) {
+        const auto last_error = GetLastError();
+        const bool requested_stop = stopping;
         stopping = true;
-        if (commands.joinable()) { CancelSynchronousIo(commands.native_handle()); commands.join(); }
+        join_commands();
         if (backend) backend->stop();
-        if (ready_sent && GetLastError() == ERROR_OPERATION_ABORTED && failure.empty()) return 0;
+        if (ready_sent && requested_stop) return last_error == ERROR_OPERATION_ABORTED && failure.empty() ? 0 : 1;
         try { send_frame(output, "{\"type\":\"error\",\"v\":1,\"message\":" + json_string(error.what()) + '}'); } catch (...) {}
         return 1;
     }
