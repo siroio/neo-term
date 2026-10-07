@@ -6,18 +6,30 @@ Windows版Emacsのバッファ内でWindowsのCLIを操作する端末パッケ�
 
 ## 導入
 
-Visual Studioの「C++によるデスクトップ開発」またはBuild Toolsを導入し、このディレクトリで実行します。
+Windows x64用のビルド済み `build/neo-term-host.exe` をGitに同梱しています。利用者側でのビルド、C++コンパイラー、Python、Emacsの動的モジュール対応は不要です。標準のバックエンドにはWindows付属のConPTYを使います。
 
-```powershell
-.\build.ps1 -Test
-```
-
-`build/neo-term-host.exe` が生成されます。実行にはC++コンパイラーやPythonは不要です。EXEは別プロセスなので、Emacsの動的モジュール対応は必要ありません。
-
-Emacs設定へ追加します。既存の設定は自動で変更しません。
+`use-package :vc` が使えるEmacsでは、次の設定でGitHubから導入できます。
 
 ```elisp
-(add-to-list 'load-path "E:/neo-emacs/neo-term")
+(use-package neo-term
+  :vc (:url "https://github.com/siroio/neo-term" :rev :newest)
+  :commands neo-term)
+```
+
+Emacs 29では `package-vc-install` でも導入できます。
+
+```elisp
+(package-vc-install "https://github.com/siroio/neo-term")
+```
+
+手動でcloneする場合:
+
+```powershell
+git clone https://github.com/siroio/neo-term.git
+```
+
+```elisp
+(add-to-list 'load-path "C:/path/to/neo-term")
 (require 'neo-term)
 ```
 
@@ -92,6 +104,20 @@ Unicodeの幅定義やフォントの幅が一致しない字形は、SVGの表�
 ```
 
 Pythonの場所は `-Python 'C:\path\to\python.exe'` で指定できます。GUI確認では実体のEmacs EXEを指定してください。自己完結した検証CLIで画面・入力・終了を確認します。
+
+開発時にEXEと検証用プログラムを再ビルドする場合は、Visual Studioの「C++によるデスクトップ開発」またはBuild Toolsを導入して実行します。
+
+```powershell
+.\build.ps1 -Test
+```
+
+ネイティブコードを変更した場合は、再ビルドした `build/neo-term-host.exe` も一緒にコミットします。その他のビルド成果物はGitの管理対象外です。`test.ps1` はビルド後に実行してください。
+
+Gitからの導入確認だけを行う場合は、次のコマンドが最新コミットを一時ディレクトリへ `use-package :vc` で導入し、同梱EXEでcmdの出力まで確認します。
+
+```powershell
+emacs -Q --batch -l tests/check-package.el
+```
 
 ## 構成とライセンス
 

@@ -1,4 +1,4 @@
-;;; check-gui.el -*- lexical-binding: t; -*-
+;;; check-gui.el -*- lexical-binding: t; no-byte-compile: t; -*-
 (setq debug-on-error t)
 (defconst neo-term-gui-root (expand-file-name ".." (file-name-directory load-file-name)))
 (load (expand-file-name "neo-term.el" neo-term-gui-root) nil t)

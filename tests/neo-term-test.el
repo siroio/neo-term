@@ -1,4 +1,4 @@
-;;; neo-term-test.el -*- lexical-binding: t; -*-
+;;; neo-term-test.el -*- lexical-binding: t; no-byte-compile: t; -*-
 (require 'ert)
 (require 'json)
 (defconst neo-term-test-root (expand-file-name ".." (file-name-directory load-file-name)))
