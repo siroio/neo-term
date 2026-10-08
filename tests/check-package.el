@@ -20,24 +20,37 @@
         (require 'neo-term)
         (cl-assert (file-in-directory-p neo-term-module-program package-user-dir))
         (cl-assert (file-exists-p neo-term-module-program))
-        (let* ((neo-term-shell "cmd.exe")
-               (neo-term-shell-arguments '("/Q"))
-               (buffer (neo-term)))
-          (unwind-protect
-              (with-current-buffer buffer
-                (let ((deadline (+ (float-time) 10)))
-                  (while (and (not neo-term--session) (< (float-time) deadline))
-                    (accept-process-output nil .05))
-                  (cl-assert neo-term--session))
-                (cl-assert (equal (alist-get 'backend neo-term--session) "system-conpty"))
-                (neo-term--send "Techo NEO^_PACKAGE_OK")
-                (neo-term--send "K1,0")
-                (let ((deadline (+ (float-time) 10)))
-                  (while (and (not (string-match-p "NEO_PACKAGE_OK" (buffer-string)))
-                              (< (float-time) deadline))
-                    (accept-process-output nil .05))
-                  (cl-assert (string-match-p "NEO_PACKAGE_OK" (buffer-string)))))
-            (when (buffer-live-p buffer) (kill-buffer buffer))))
+        (with-temp-buffer
+          (let ((result
+                 (call-process
+                  (expand-file-name invocation-name invocation-directory)
+                  nil t nil "-Q" "--batch"
+                  "-L" (file-name-directory (locate-library "neo-term"))
+                  "--eval"
+                  (prin1-to-string
+                   '(progn
+                      (require 'neo-term)
+                      (let* ((neo-term-shell "cmd.exe")
+                             (neo-term-shell-arguments '("/Q"))
+                             (buffer (neo-term)))
+                        (unwind-protect
+                            (with-current-buffer buffer
+                              (let ((deadline (+ (float-time) 10)))
+                                (while (and (not neo-term--session) (< (float-time) deadline))
+                                  (accept-process-output nil .05))
+                                (cl-assert neo-term--session))
+                              (cl-assert (equal (alist-get 'backend neo-term--session) "system-conpty"))
+                              (neo-term--send "Techo NEO^_PACKAGE_OK")
+                              (neo-term--send "K1,0")
+                              (let ((deadline (+ (float-time) 10)))
+                                (while (and (not (string-match-p "NEO_PACKAGE_OK" (buffer-string)))
+                                            (< (float-time) deadline))
+                                  (accept-process-output nil .05))
+                                (cl-assert (string-match-p "NEO_PACKAGE_OK" (buffer-string)))))
+                          (when (buffer-live-p buffer) (kill-buffer buffer)))))))))
+            (unless (equal result 0)
+              (error "Installed DLL session failed (%s): %s"
+                     result (buffer-string)))))
         (princ "NEO_TERM_PACKAGE=PASS\n"))
     (when (and (file-in-directory-p directory temporary-file-directory)
                (string-prefix-p "neo-term-package-" (file-name-nondirectory directory)))
