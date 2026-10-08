@@ -1,0 +1,43 @@
+;;; benchmark-module.el -*- lexical-binding: t; no-byte-compile: t; -*-
+(load (expand-file-name "../neo-term.el" (file-name-directory load-file-name)) nil t)
+
+(defun neo-term-benchmark-wait (predicate)
+  (let ((deadline (+ (float-time) 15)))
+    (while (and (not (funcall predicate)) (< (float-time) deadline))
+      (accept-process-output nil .001))
+    (unless (funcall predicate) (error "Benchmark timed out: %s" neo-term--status))))
+
+(let (results)
+  (dolist (transport '(dll))
+    (dotimes (trial 3)
+      (let* ((neo-term-transport transport)
+             (neo-term-backend 'bundled-conpty)
+             (neo-term-shell (expand-file-name "build/console-fixture.exe" neo-term--directory))
+             (neo-term-shell-arguments '("interactive"))
+             (buffer (neo-term)) samples)
+        (unwind-protect
+            (with-current-buffer buffer
+              (neo-term-benchmark-wait (lambda () (neo-term--render) (string-match-p "FIXTURE_READY" (buffer-string))))
+              (dolist (character (string-to-list "abcdefghijklmno"))
+                (let ((start (float-time)))
+                  (neo-term--send (format "U%d,0" character))
+                  (neo-term-benchmark-wait (lambda () (neo-term--render) (string-match-p (format "CHAR=%d\\b" character) (buffer-string))))
+                  (push (* 1000 (- (float-time) start)) samples)))
+              (push `((transport . ,(symbol-name transport)) (trial . ,trial)
+                      (input_render_ms . ,(vconcat (nreverse samples)))) results))
+          (when (buffer-live-p buffer) (kill-buffer buffer))))
+      (let* ((neo-term-transport transport)
+             (neo-term-backend 'bundled-conpty)
+             (neo-term-shell (expand-file-name "build/console-fixture.exe" neo-term--directory))
+             (neo-term-shell-arguments '("vt"))
+             (start (float-time))
+             (buffer (neo-term)))
+        (unwind-protect
+            (with-current-buffer buffer
+              (neo-term-benchmark-wait (lambda () (equal neo-term--status "exit 0")))
+              (neo-term--render)
+              (unless (string-match-p "burst 2999" (buffer-string)) (error "Output tail missing"))
+              (push `((transport . ,(symbol-name transport)) (trial . ,trial)
+                      (burst_render_seconds . ,(- (float-time) start))) results))
+          (when (buffer-live-p buffer) (kill-buffer buffer))))))
+  (princ (json-serialize (vconcat (nreverse results)))))

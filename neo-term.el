@@ -9,19 +9,23 @@
 (require 'svg)
 (require 'url-util)
 (require 'thingatpt)
+(declare-function neo-term--module-start "neo-term-module" (port arguments directory runtime environment))
+(declare-function neo-term--module-command "neo-term-module" (session command))
 
 (defgroup neo-term nil "Windows native terminals."
   :group 'processes)
 (defconst neo-term--directory (file-name-directory (or load-file-name buffer-file-name)))
-(defcustom neo-term-host-program (expand-file-name "build/neo-term-host.exe" neo-term--directory)
-  "Path to the native helper."
+(defcustom neo-term-module-program (expand-file-name "build/neo-term-module.dll" neo-term--directory)
+  "Path to the Emacs terminal module."
   :type 'file)
+(defcustom neo-term-transport 'dll
+  "Native connection.  The DLL is required; auto also uses only the DLL."
+  :type '(choice (const dll) (const auto)))
 (defcustom neo-term-backend 'auto
   "Backend selected before the shell starts."
   :type '(choice (const auto)
                  (const bundled-conpty)
-                 (const system-conpty)
-                 (const classic)))
+                 (const system-conpty)))
 (defcustom neo-term-no-conpty nil "Exclude both ConPTY backends."
   :type 'boolean)
 (defcustom neo-term-shell (or (executable-find "pwsh.exe") "powershell.exe")
@@ -112,7 +116,9 @@
 (defun neo-term--send (command)
   (unless (process-live-p neo-term--process)
     (user-error "Terminal has exited"))
-  (process-send-string neo-term--process (neo-term--frame command)))
+  (let ((module (process-get neo-term--process 'neo-term-module)))
+    (unless module (user-error "Terminal module is not ready"))
+    (neo-term--module-command module command)))
 
 (defun neo-term--consume (bytes)
   (setq neo-term--pending (concat neo-term--pending bytes))
@@ -145,11 +151,14 @@
      (neo-term--screen event))
     ("exit"
      (setq neo-term--status (format "exit %s"
-                                    (alist-get 'code event))))
+                                    (alist-get 'code event)))
+     (when (and (processp neo-term--process)
+                (process-get neo-term--process 'neo-term-module))
+       (delete-process neo-term--process)))
     ("error"
      (setq neo-term--status "error")
-     (message "neo-term: %s"
-              (alist-get 'message event)))
+     (message "neo-term: %s" (alist-get 'message event))
+     (when (processp neo-term--process) (delete-process neo-term--process)))
     (_ (error "Unknown terminal event")))
   (force-mode-line-update))
 
@@ -896,6 +905,8 @@
 (defun neo-term-clear (&optional invert)
   "Clear the console screen while keeping the CLI and scrollback."
   (interactive "P")
+  (when (and neo-term--session (and (assq 'clear neo-term--session) (not (alist-get 'clear neo-term--session))))
+    (user-error "Screen clear requires a ConPTY runtime with the clear API"))
   (neo-term--resume-input)
   (when (if invert (not neo-term-clear-scrollback-when-clearing)
           neo-term-clear-scrollback-when-clearing)
@@ -1079,7 +1090,11 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
     (cancel-timer neo-term--timer))
   (when (process-live-p neo-term--process)
     (ignore-errors (neo-term--send "C"))
-    (delete-process neo-term--process)))
+    (delete-process neo-term--process))
+  (dolist (process (process-list))
+    (when (and (eq (process-buffer process) (current-buffer))
+               (process-get process 'neo-term-auth-server))
+      (delete-process process))))
 
 (define-derived-mode neo-term-mode special-mode "Neo-Term"
   "Windows terminal. C-c is the terminal command prefix; C-q sends a reserved key."
@@ -1154,10 +1169,9 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
           (expand-file-name "shell/neo-term.bash" neo-term--directory) "-i"))
    (t neo-term-shell-arguments)))
 
-(defun neo-term--host-command (size)
+(defun neo-term--module-arguments (size)
   (append
-   (list neo-term-host-program
-         "--backend"
+   (list "--backend"
          (symbol-name neo-term-backend)
          "--cols"
          (number-to-string (car size))
@@ -1186,7 +1200,8 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
       (neo-term))))
 
 (defun neo-term--process-filter (process bytes)
-  (when (buffer-live-p (process-buffer process))
+  (when (and (buffer-live-p (process-buffer process))
+             (eq process (buffer-local-value 'neo-term--process (process-buffer process))))
     (with-current-buffer (process-buffer process)
       (condition-case failure
           (neo-term--consume bytes)
@@ -1197,13 +1212,20 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
          (delete-process process))))))
 
 (defun neo-term--process-sentinel (process event)
-  (when (buffer-live-p (process-buffer process))
+  (let ((module (process-get process 'neo-term-module)))
+    (when (and module (not (process-live-p process)))
+      (ignore-errors (neo-term--module-command module "C"))))
+  (when (and (buffer-live-p (process-buffer process))
+             (eq process (buffer-local-value 'neo-term--process (process-buffer process))))
     (with-current-buffer (process-buffer process)
-      (unless (string-prefix-p "exit " neo-term--status)
+      (unless (or (string-prefix-p "exit " neo-term--status)
+                  (member neo-term--status '("error" "protocol error")))
         (setq neo-term--status (string-trim event)))
       (force-mode-line-update)
       (when (and neo-term-kill-buffer-on-exit
-                 (memq (process-status process) '(exit signal)))
+                 (or (memq (process-status process) '(exit signal))
+                     (and (process-get process 'neo-term-module)
+                          (string-prefix-p "exit " neo-term--status))))
         (kill-buffer (current-buffer))))))
 
 ;;;###autoload
@@ -1213,15 +1235,87 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
   (let ((display-buffer-overriding-action '(display-buffer-pop-up-window)))
     (neo-term)))
 
+(defun neo-term--use-module ()
+  (unless (memq neo-term-transport '(dll auto))
+    (user-error "neo-term requires the DLL transport"))
+  (when (or neo-term-no-conpty (eq neo-term-backend 'classic))
+    (user-error "neo-term requires ConPTY; the classic backend has been removed"))
+  (unless (and (fboundp 'module-load) (file-exists-p neo-term-module-program))
+    (user-error "neo-term-module.dll and an Emacs with dynamic module support are required"))
+  (unless (fboundp 'neo-term--module-start) (module-load neo-term-module-program))
+  t)
+
+(defun neo-term--start-process (size _module)
+  (setq neo-term--process
+        (make-network-process :name (buffer-name) :buffer (current-buffer)
+                              :noquery t :coding 'binary :family 'ipv4
+                              :host "127.0.0.1" :service t :server t
+                              :log #'neo-term--module-connection
+                              :sentinel #'neo-term--process-sentinel))
+  (condition-case failure
+      (let ((session (neo-term--module-start
+                      (process-contact neo-term--process :service)
+                      (vconcat (neo-term--module-arguments size)) default-directory
+                      (expand-file-name "runtime" (file-name-directory neo-term-module-program))
+                      (vconcat process-environment))))
+        (process-put neo-term--process 'neo-term-module (aref session 0))
+        (process-put neo-term--process 'neo-term-token (aref session 1)))
+    (error (delete-process neo-term--process)
+           (signal (car failure) (cdr failure)))))
+
+(defun neo-term--module-connection (server client _message)
+  (if (buffer-live-p (process-buffer server))
+      (progn
+        (set-process-buffer client (process-buffer server))
+        (set-process-query-on-exit-flag client nil)
+        (process-put client 'neo-term-auth-server server)
+        (set-process-sentinel client #'ignore)
+        (set-process-filter client #'neo-term--module-auth-filter))
+    (delete-process client)))
+
+(defun neo-term--module-auth-filter (client bytes)
+  (let* ((server (process-get client 'neo-term-auth-server))
+         (pending (concat (or (process-get client 'neo-term-auth-pending) (unibyte-string)) bytes)))
+    (condition-case nil
+        (when (>= (length pending) 4)
+          (let ((size (cl-loop for index below 4 sum (ash (aref pending index) (* 8 index)))))
+            (unless (<= 1 size 1024) (error "Invalid module authentication"))
+            (when (>= (length pending) (+ size 4))
+              (let ((event (json-parse-string (decode-coding-string (substring pending 4 (+ size 4)) 'utf-8 t)
+                                               :object-type 'alist)))
+                (unless (and (equal (alist-get 'type event) "auth")
+                             (stringp (alist-get 'token event))
+                             (equal (alist-get 'token event) (process-get server 'neo-term-token))
+                             (buffer-live-p (process-buffer server)))
+                  (error "Invalid module authentication")))
+              (with-current-buffer (process-buffer server)
+                (unless (eq neo-term--process server) (error "Module session closed"))
+                (dolist (property '(neo-term-module))
+                  (process-put client property (process-get server property)))
+                (process-put client 'neo-term-auth-pending nil)
+                (process-put server 'neo-term-module nil)
+                (setq neo-term--process client)
+                (dolist (process (process-list))
+                  (when (and (not (eq process client))
+                             (eq (process-get process 'neo-term-auth-server) server))
+                    (delete-process process)))
+                (delete-process server)
+                (set-process-sentinel client #'neo-term--process-sentinel)
+                (set-process-filter client #'neo-term--process-filter)
+                (neo-term--process-filter client (substring pending (+ size 4))))
+              (setq pending nil))))
+      (error (delete-process client) (setq pending nil)))
+    (when pending
+      (process-put client 'neo-term-auth-pending pending))))
+
 ;;;###autoload
 (defun neo-term ()
   "Start a Windows terminal in a new buffer and return that buffer."
   (interactive)
   (unless (eq system-type 'windows-nt)
     (user-error "neo-term requires Windows"))
-  (unless (file-executable-p neo-term-host-program)
-    (user-error "Build the neo-term helper with build.ps1 first"))
-  (let* ((buffer (generate-new-buffer "*neo-term*"))
+  (let* ((module (neo-term--use-module))
+         (buffer (generate-new-buffer "*neo-term*"))
          (size (neo-term--size (selected-window)))
          (directory default-directory))
     (with-current-buffer buffer
@@ -1229,16 +1323,7 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
       (setq default-directory directory
             neo-term--requested-size size)
       (condition-case error
-          (setq neo-term--process
-                (make-process
-                 :name (buffer-name buffer)
-                 :buffer buffer
-                 :noquery t
-                 :connection-type 'pipe
-                 :coding 'binary
-                 :command (neo-term--host-command size)
-                 :filter #'neo-term--process-filter
-                 :sentinel #'neo-term--process-sentinel))
+          (neo-term--start-process size module)
         (error (kill-buffer buffer)
                (signal (car error)
                        (cdr error)))))

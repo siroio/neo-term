@@ -1,4 +1,10 @@
 if (-not $global:neoTermPromptInstalled) {
+    if ($env:NEO_TERM_PIPE) {
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [Console]::InputEncoding = $utf8
+        [Console]::OutputEncoding = $utf8
+        $global:OutputEncoding = $utf8
+    }
     $global:neoTermOriginalPrompt = (Get-Item Function:\prompt).ScriptBlock
     $global:neoTermPromptInstalled = $true
 
@@ -9,7 +15,14 @@ if (-not $global:neoTermPromptInstalled) {
         $savedExitCode = $global:LASTEXITCODE
         try {
             $bytes = [Text.Encoding]::UTF8.GetBytes($Message)
-            & $env:NEO_TERM_HOST --notify encoded ([Convert]::ToBase64String($bytes))
+            $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $env:NEO_TERM_PIPE,
+                                                       [IO.Pipes.PipeDirection]::Out)
+            try {
+                $pipe.Connect(2000)
+                $pipe.Write($bytes, 0, $bytes.Length)
+            } finally {
+                $pipe.Dispose()
+            }
         } finally {
             $global:LASTEXITCODE = $savedExitCode
         }

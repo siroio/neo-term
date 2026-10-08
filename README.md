@@ -1,14 +1,10 @@
 # neo-term
 
-Windows版Emacsのバッファ内でWindowsのCLIを操作する端末パッケージです。C++の仲介EXEが起動時にバックエンドを選び、Emacs Lispが画面と入力を扱います。winptyは使用しません。
-
-動作確認環境はWindows x64（OS build 26300）、GUI版Emacs 31.1、MSVCです。必要環境はWindows 10 1809以降のx64とSVG対応のGUI Emacs 29.1以降です。ほかのバージョンは未検証です。
+Windows版Emacsのバッファ内でWindowsのCLIを操作する端末パッケージです。Emacsに読み込んだC++のDLLがConPTYを制御し、Emacs Lispが画面と入力を扱います。
 
 ## 導入
 
-Windows x64用のビルド済み `build/neo-term-host.exe` をGitに同梱しています。利用者側でのビルド、C++コンパイラー、Python、Emacsの動的モジュール対応は不要です。標準のバックエンドにはWindows付属のConPTYを使います。
-
-`use-package :vc` が使えるEmacsでは、次の設定でGitHubから導入できます。
+Windows x64用の `build/neo-term-module.dll` を同梱しています。仲介EXEは配布・ビルド・起動しません。動的モジュールとSVGに対応したGUI Emacs 29.1以降、Windows 10 1809以降のx64が必要です。動作確認はEmacs 31.1 / Windows build 26300です。利用時にコンパイラーやPythonは不要です。
 
 ```elisp
 (use-package neo-term
@@ -16,56 +12,30 @@ Windows x64用のビルド済み `build/neo-term-host.exe` をGitに同梱して
   :commands neo-term)
 ```
 
-Emacs 29では `package-vc-install` でも導入できます。
-
-```elisp
-(package-vc-install "https://github.com/siroio/neo-term")
-```
-
-手動でcloneする場合:
-
-```powershell
-git clone https://github.com/siroio/neo-term.git
-```
+手動でcloneした場合:
 
 ```elisp
 (add-to-list 'load-path "C:/path/to/neo-term")
 (require 'neo-term)
 ```
 
-`M-x neo-term` で新しいセッションを開きます。既定はpwshがあればpwsh、なければWindows PowerShellです。起動時の `default-directory` を引き継ぎます。
+`M-x neo-term` で起動します。pwshがあればpwsh、なければWindows PowerShellを使い、起動時の `default-directory` と環境変数を引き継ぎます。`M-x neo-term-other-window`、`neo-term-cmd`、`neo-term-git-bash` も使用できます。`neo-term-kill-buffer-on-exit` を `t` にするとCLIの終了時にバッファを閉じます。
 
-`M-x neo-term-other-window` は別ウィンドウで開きます。`neo-term-kill-buffer-on-exit` を `t` にすると、CLIの終了時にバッファも閉じます。
+## ConPTYランタイム
 
-cmdを使用する場合:
+`neo-term-backend` は `auto`（既定）、`bundled-conpty`、`system-conpty` から選べます。`auto` は同梱ConPTY、Windows標準ConPTYの順で初期化します。CLI起動後に別方式へ再起動しません。DLLの読み込みや初期化が失敗しても仲介EXEへ切り替えません。従来Console APIの `classic` と `neo-term-no-conpty` は使用できません。
 
-`M-x neo-term-cmd` でcmd.exe、`M-x neo-term-git-bash` でGit Bashを開けます。Git BashはGit for Windowsのインストール先から検出します。
+`neo-term-transport` は `dll` が既定です。既存設定の `auto` もDLLのみを使い、`exe` はエラーになります。バックエンド制御・入力・画面取得はDLL内のワーカースレッドで処理します。入力は非同期キュー、画面通知はトークン認証付きの127.0.0.1接続を使います。バッファ破棄はCLIの終了処理を待ちません。
 
-```elisp
-(setq neo-term-shell "cmd.exe"
-      neo-term-shell-arguments '("/Q"))
-```
-
-## バックエンド
-
-`neo-term-backend` は `auto`、`bundled-conpty`、`system-conpty`、`classic` から選べます。`auto` は同梱ConPTY → Windows標準ConPTY → 従来Console APIの順に初期化を試します。明示指定時はその方式だけを使います。CLI起動後の切り替え・再起動は行いません。
-
-ConPTYを一切使いたくない場合:
-
-```elisp
-(setq neo-term-no-conpty t
-      neo-term-backend 'auto)
-```
-
-`M-x neo-term-describe-session` または `C-x C-d` で、選択結果・ランタイムパス・初期化失敗理由を確認できます。APIの可用性を調べる方式なので、すべてのCLIとの互換性を判定するものではありません。
-
-同梱版は任意です。Microsoft公式NuGetパッケージの固定版 **1.25.260930003** を導入する場合:
+Microsoft公式ConPTY **1.25.260930003** は次のコマンドで導入できます。
 
 ```powershell
 .\install-runtime.ps1
 ```
 
-パッケージをダウンロードし、SHA256を照合して `build/runtime/conpty.dll` と `OpenConsole.exe` を取り出します。通常起動時にはネットワークへ接続しません。EXEを移動する場合は同じディレクトリの `runtime/` へランタイムを配置します。再配布時はMicrosoftのMITライセンスも添付してください。
+SHA256を照合し `build/runtime/conpty.dll` と `OpenConsole.exe` を配置します。OpenConsole.exe / Windowsのconhost.exeとCLI自身のプロセスは引き続き必要です。通常利用時に外部ネットワークへ接続しません。ランタイムの再配布にはMicrosoftのMITライセンスも添付してください。
+
+画面クリア `C-l` はConPTYの消去APIを使います。そのAPIがない標準ConPTYでは、CLIを維持したまま操作をエラーにします。同梱ConPTYでは画面クリア・履歴保持・その後の入力を確認済みです。`M-x neo-term-describe-session` / `C-x C-d` で使用したランタイムと初期化失敗理由を確認できます。
 
 ## 操作
 
@@ -97,9 +67,9 @@ ConPTYを一切使いたくない場合:
 
 ## シェル連携とコピー
 
-通常のPowerShell/pwsh起動では、付属の初期化コードを `-EncodedCommand` で渡します。既存のprompt関数を呼び出し、その表示を維持しながら、OSC 133でプロンプト開始・入力開始を通知します。従来APIでは名前付きパイプを使ってコンソール座標を通知します。作業ディレクトリも名前付きパイプで送ります。実行ポリシーやプロファイルファイルは変更しません。`-Command`、`-File`、独自の起動引数がある場合は起動内容を変更しません。
+通常のPowerShell/pwsh起動では、付属の初期化コードを `-EncodedCommand` で渡します。neo-term内のセッションのコンソール入出力とネイティブプログラムへのパイプ出力をBOMなしUTF-8に設定し、Windows PowerShellで絵文字が `?` に変換されることを防ぎます。既存のprompt関数を呼び出し、その表示を維持しながら、OSC 133でプロンプト開始・入力開始を通知します。名前付きパイプへ直接コンソール座標を通知します。作業ディレクトリも名前付きパイプで送ります。実行ポリシーやプロファイルファイルは変更しません。`-Command`、`-File`、独自の起動引数がある場合は起動内容を変更しません。
 
-cmd.exeは起動用スクリプトで既存のPROMPTを包み、Git Bashは既存のPS1・PROMPT_COMMANDを維持して通知を追加します。Git Bashは既存の `.bashrc` を読み込みますが変更しません。通常の対話起動だけが自動連携の対象です。ConPTYでは3シェルともプロンプト位置を通知し、その位置を色付き履歴とリサイズ後のセルへ引き継ぎます。従来APIの正確な位置通知はPowerShellのみで、cmd.exe・Git Bashはcwdとファイル連携に対応します。
+cmd.exeは起動用スクリプトで既存のPROMPTを包み、Git Bashは既存のPS1・PROMPT_COMMANDを維持して通知を追加します。Git Bashは既存の `.bashrc` を読み込みますが変更しません。通常の対話起動だけが自動連携の対象です。ConPTYでは3シェルともプロンプト位置を通知し、その位置を色付き履歴とリサイズ後のセルへ引き継ぎます。PowerShellとcmdは名前付きパイプ、Git BashはBash標準のTCP接続で通知します。通知用EXEは起動しません。
 
 各シェルで `neo-open README.md 12 3` を実行すると、Emacsの別ウィンドウでファイルを開き、12行目・3列目へ移動します。行・列は1始まりで省略できます。`C-c C-f` は選択範囲やカーソル位置の `src/main.cpp:12:3` などを開きます。相対パスはシェルの作業ディレクトリを基準に解決します。シェルからのファイル要求を無効にするには `neo-term-enable-file-requests` を `nil` にします。
 
@@ -113,11 +83,9 @@ ConPTYでは画面幅による折り返しと明示的な改行を区別しま�
 
 `C-c C-p` / `C-c C-n` はコピーモードへ入り、追跡済みの前／次のプロンプトの入力開始位置へ移動します。数値引数で移動数を指定できます。コピーモードの `C-a` は入力開始位置へ移動し、そこでもう一度押すと論理行の先頭へ移動します。幅によってプロンプトが折り返されても追跡します。
 
-従来Console APIでも取得済みの履歴の16色・属性を保持し、幅変更に合わせて履歴を再配置します。ただしAPIが折り返し情報を返さないため、元の各行を独立した論理行として扱います。ConPTYと同じ折り返し結合はできません。
-
 ConPTYが全角文字を折り返す際、空きセルを実際のSPACEとして転送する場合があります。このSPACEはCLIが出した空白と区別できないため、コピーに残ることがあります。空きセルとして識別できるものだけを除き、本来の空白を推測で削除しません。位置通知のない既存連携では、プロンプトと同じ文字列で始まる通常出力を誤認する場合があります。
 
-ConPTYではCLIが指定したブロック・下線・バーのカーソル形状と点滅を、バッファごとに反映します。コピーモードではEmacs操作用のバーになります。従来APIではコンソールのカーソルサイズからブロック・下線を選び、Windowsの点滅設定を使います。バー形状や個別のVT点滅指定は従来APIから取得できません。
+ConPTYではCLIが指定したブロック・下線・バーのカーソル形状と点滅を、バッファごとに反映します。コピーモードではEmacs操作用のバーになります。
 
 タイトルをバッファ名に反映する場合:
 
@@ -131,63 +99,40 @@ ConPTYではOSC 52によるコピーにも対応します。既定は無効で�
 (setq neo-term-enable-osc52 t)
 ```
 
-マウス報告を要求するConPTYアプリにはクリック・ボタン解放・ホイール入力を送ります。`neo-term-enable-mouse` を `nil` にすると無効になります。コピーモードではEmacsの選択・コピー操作になります。この環境の同梱ConPTYで動作を確認しました。標準ConPTYではマウスのモード要求が転送されず、使えない場合があります。従来APIでのアプリ向けマウス入力は未対応です。
+マウス報告を要求するConPTYアプリにはクリック・ボタン解放・ホイール入力を送ります。`neo-term-enable-mouse` を `nil` にすると無効になります。コピーモードではEmacsの選択・コピー操作になります。この環境の同梱ConPTYで動作を確認しました。標準ConPTYではマウスのモード要求が転送されず、使えない場合があります。
 
 ウィンドウサイズ変更をCLIへ通知します。バッファを破棄すると、そのCLIとJob Object内の子孫プロセスを終了します。
 
 ## 検証と制限
 
-| 項目 | 同梱ConPTY | 標準ConPTY | 従来API |
-| --- | --- | --- | --- |
-| cmd / Windows PowerShellの対話操作 | 確認済み | 確認済み | 確認済み |
-| 日本語・引数・キー・Ctrl+C・リサイズ | 確認済み | 確認済み | 確認済み |
-| 絵文字の出力 | 確認済み | 確認済み | 置換文字になる場合あり |
-| True Color・代替画面・大量出力 | 確認済み | 確認済み | 16色・代替画面識別なし |
-| 通信断・バッファ破棄による終了 | 確認済み | 確認済み | 確認済み |
+ネイティブ契約・libvterm再配置/分割VTテスト、DLL経由のCLI統合40件、ERT46件、DLL統合20件、警告なしのbyte compile、GUIを検証します。CLIテストは実際のEmacsにDLLを読み込ませるテスト用Lispから制御し、仲介EXEを使いません。従来API固有のテストは削除し、出力が詰まった状態の非同期終了はDLL統合テストで確認します。
 
-ネイティブ契約・libvterm再配置テスト、CLI統合テスト32件（実機Vimを含むバックエンド別のサブケース）、ERT46件、警告なしのbyte compile、GUI確認を行います。Vimテストは `NEO_TERM_TEST_VIM` またはPATH上のvim.exeが必要で、未指定時はスキップします。
+日本語・絵文字・結合文字、40回のリサイズ、3000行の履歴末尾、Ctrl+C、子孫プロセスの終了、30回の起動/GC、セッション別cwd/環境、DLL不足/初期化失敗、画面クリア、PowerShell/cmd/Git Bashの通知、実際のVimでのUnicode保存を検証します。GUIでは入力・コピー・色・代替画面・プロンプト・カーソル・ファイル要求・同梱ConPTYのマウスを確認します。
 
-描画は変更行と履歴の増減だけを書き換え、カーソルだけの更新では文字を書き換えません。リサイズ・代替画面の切り替えでは再構築します。GUIでは3バックエンドの基本操作・PowerShellのcwd/プロンプト連携、ConPTYの全画面・色・代替画面、同梱ConPTYのマウス操作を検証します。
-
-このPCのバッチ描画ベンチマークでは、履歴2000行・80列24行・200回更新で、カーソルだけの更新は約0.051秒、1行を変更する更新は約0.231秒でした。vtermとの直接比較やGUIの応答時間を示す値ではありません。再測定は `emacs -Q --batch -l tests/benchmark-render.el` で行えます。
-
-Unicodeの幅定義やフォントの幅が一致しない字形は、SVGの表示プロパティでセル幅へ合わせます。バッファ内の文字列はそのままなので、日本語や絵文字をコピーできます。
-
-従来APIは表示領域と残っているコンソール履歴をポーリングします。短時間に上書きされた文字やコンソール保持領域から消えた履歴は取りこぼす場合があります。`ReadConsoleOutputW` は非BMP文字をU+FFFDに変換する場合があり、失われた絵文字を復元できません。ConPTY系も完全なvterm互換ではありません。画像、ここに記載した以外のシェル連携、任意のTUIの完全互換は未対応です。
-
-このPCのWindows標準ConPTYでは、行末で折り返し待ちの入力カーソルが反復リサイズで1文字前へ戻り、次の入力で末尾を上書きするケースを確認しています。同梱ConPTYでは入力末尾を保持することを検証しています。`auto` は同梱版を優先します。アプリケーション自身が管理するカーソルを強制移動するとTUIの描画・入力と競合するため、標準版へのカーソル補正は行っていません。
-
-テストにはPython 3とEmacsが必要です。
-
-```powershell
-.\test.ps1
-.\test.ps1 -Gui -Emacs 'C:\path\to\Emacs\bin\emacs.exe'
-```
-
-Pythonの場所は `-Python 'C:\path\to\python.exe'` で指定できます。GUI確認では実体のEmacs EXEを指定してください。自己完結した検証CLIで画面・入力・終了を確認します。
-
-開発時にEXEと検証用プログラムを再ビルドする場合は、Visual Studioの「C++によるデスクトップ開発」またはBuild Toolsを導入して実行します。
+開発時はVisual StudioのC++ツールを使ってビルドします。テストにはPython 3、動的モジュール対応Emacs、同梱ConPTYが必要です。Vimは `NEO_TERM_TEST_VIM` またはPATHで指定し、見つからない場合はスキップします。
 
 ```powershell
 .\build.ps1 -Test
+$env:NEO_TERM_TEST_VIM = 'C:/path/to/vim.exe'
+.\test.ps1 -Gui -Python 'C:/path/to/python.exe' -Emacs 'C:/path/to/emacs.exe'
 ```
 
-ネイティブコードを変更した場合は、再ビルドした `build/neo-term-host.exe` も一緒にコミットします。その他のビルド成果物はGitの管理対象外です。`test.ps1` はビルド後に実行してください。
+ネイティブ変更時は `build/neo-term-module.dll` も更新します。テスト用のCLI実行ファイルはGit管理・配布の対象外です。Gitからの導入確認は `emacs -Q --batch -l tests/check-package.el` で行えます。
 
-Gitからの導入確認だけを行う場合は、次のコマンドが最新コミットを一時ディレクトリへ `use-package :vc` で導入し、同梱EXEでcmdの出力まで確認します。
+DLL化時の同じEmacsによるバッチ測定では、入力から描画までの中央値は約1.9ms、起動から3000行出力・最終描画・終了まで約1.87秒でした。GUIの実測値ではありません。再測定は `emacs -Q --batch -l tests/benchmark-module.el` で行えます。描画処理の測定は `tests/benchmark-render.el` です。
 
-```powershell
-emacs -Q --batch -l tests/check-package.el
-```
+変更行と履歴の増減だけを描画し、カーソルだけの更新では文字を書き換えません。ConPTYの出力がある場合だけ画面を取得し、通常の通知は8msでまとめます。未送信の履歴が64行以上ある間は待たずに送信します。親の終了後はJob Object内の子孫を終了させ、出力のEOFと残った履歴を確認してから終了を通知します。
+
+Unicode 16.0.0の文字幅・結合文字表を使用します。複数コードポイントからなる絵文字の全組み合わせ、画像、任意のTUIの完全互換は保証していません。標準ConPTYでは反復リサイズで入力末尾を上書きするケースがあり、同梱ConPTYでは末尾保持を確認しています。標準ConPTYのVim保存で一度タイムアウトしたことがあり、単独再実行とその後の全CLIテストは成功しましたが原因は未特定です。
 
 ## 構成とライセンス
 
-`native/` はWin32・ConPTY・libvtermによるCLI制御、`neo-term.el` はEmacs画面、`tests/` は仕様と実機テストです。通信は4MiB上限の長さ付きフレームを使い、入力は固定種別、出力はUTF-8 JSONです。ConPTYのUTF-8/VT変換はC++側で解釈します。
+`native/module.cpp` はEmacsモジュールとセッションの寿命、`native/conpty.cpp` はConPTY/libvterm、`neo-term.el` は表示と操作です。画面通知は4MiB上限の長さ付きUTF-8 JSONです。Emacs APIはEmacsから呼ばれたモジュール関数内だけで使用します。通知をLispコードとして実行しません。
 
-`native/shell.hpp` はセッションごとのローカル名前付きパイプと通知用の `--notify` を扱います。通知は16KiBを上限とし、ファイル要求はデータとして解釈します。通知のBase64変換にはWindows付属のCrypt32を使い、追加ランタイムは必要ありません。
+`native/shell.hpp` はセッション固有の名前付きパイプと127.0.0.1限定のTCP通知を扱います。通知は16KiBを上限とし、TCPでは256bitのセッショントークンを照合します。接続途中の通知には2秒の期限があります。PowerShellは.NET、cmdはシェルのリダイレクト、Git Bashは標準のTCP機能から直接送信します。
 
-neo-termはGPL-3.0-or-laterです。libvterm **0.3.3** はMITライセンスで、ソースとライセンスを `vendor/libvterm/` に同梱しています。tarballのSHA256は `09156F43DD2128BD347CBEEBE50D9A571D32C64E0CF18D211197946AFF7226E0` です。
+neo-termはGPL-3.0-or-laterです。libvterm **0.3.3** はMITで、ソースとライセンスを `vendor/libvterm/` に同梱しています。Emacsモジュールヘッダーは `vendor/emacs-module.h` です。
 
-同梱libvtermの `src/screen.c`、`src/state.c`、`include/vterm.h` に再配置とプロンプト位置保持の修正を適用しています。主画面は全角セルを分割せずに再配置し、画面からあふれた行の属性・継続情報・プロンプト位置と入力カーソルを保持します。代替画面は行・列の位置を維持します。元のtarballとはこの3ファイルが異なり、`tests/vterm-reflow-test.cpp` が先頭行・日本語・絵文字・結合文字・属性・カーソル・プロンプトの反復リサイズを検証します。
+libvtermには全角セルの再配置・履歴の属性/継続/プロンプト位置保持・カーソル保持と、受信途中のVT解釈状態に触れない画面クリアAPIを追加しています。`tests/vterm-reflow-test.cpp` がこれらを検証します。
 
-設計の背景: [ConPTYの同期I/O](https://learn.microsoft.com/en-us/windows/console/createpseudoconsole)、[Emacsの互換性議論](https://lists.gnu.org/archive/html/bug-gnu-emacs/2024-06/msg00811.html)、[従来APIの非BMP制限](https://github.com/microsoft/terminal/issues/10810)、[公式ConPTYパッケージ](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY/1.25.260930003)。
+Unicodeの表は公式の [UnicodeData.txt](https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt) と [EastAsianWidth.txt](https://www.unicode.org/Public/16.0.0/ucd/EastAsianWidth.txt) から生成し、Unicode License V3を同梱しています。再生成は `python vendor/libvterm/update-unicode.py PATH/UnicodeData.txt PATH/EastAsianWidth.txt` です。

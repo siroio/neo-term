@@ -65,7 +65,7 @@ try {
         throw 'Native test compilation failed.'
     }
 
-    if (Test-Path -LiteralPath "$root/native/host.cpp") {
+    if (Test-Path -LiteralPath "$root/native/module.cpp") {
         $include = "/I$root/vendor/libvterm/include"
         $sources = Get-ChildItem -LiteralPath "$root/vendor/libvterm/src" -Filter '*.c' |
             ForEach-Object FullName
@@ -80,12 +80,6 @@ try {
             $objectName = [IO.Path]::GetFileNameWithoutExtension($_) + '.obj'
             Join-Path $output $objectName
         }
-        $hostSources = @(
-            "$root/native/host.cpp"
-            "$root/native/conpty.cpp"
-            "$root/native/classic.cpp"
-        )
-
         & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include "$root/tests/vterm-reflow-test.cpp" @objects /Fe:vterm-reflow-test.exe
         if ($LASTEXITCODE -ne 0) {
             throw 'Terminal reflow test compilation failed.'
@@ -97,10 +91,9 @@ try {
             }
         }
 
-        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include @hostSources @objects /Fe:neo-term-host.exe user32.lib crypt32.lib
-
+        & cl.exe @flags /std:c++17 /Zc:__cplusplus /EHsc /W4 /WX /LD $include "$root/native/module.cpp" "$root/native/conpty.cpp" @objects /Fe:neo-term-module.dll user32.lib crypt32.lib ws2_32.lib bcrypt.lib
         if ($LASTEXITCODE -ne 0) {
-            throw 'Host compilation failed.'
+            throw 'Emacs module compilation failed.'
         }
 
         & cl.exe @flags /std:c++17 /EHsc /W4 /WX "$root/tests/console-fixture.cpp" /Fe:console-fixture.exe user32.lib

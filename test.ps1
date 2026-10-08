@@ -16,7 +16,8 @@ try {
         throw 'Terminal reflow specifications failed.'
     }
 
-    & $Python -X utf8 -m unittest discover -s tests -p test_host.py
+    $env:NEO_TERM_TEST_EMACS = $Emacs
+    & $Python -X utf8 -m unittest discover -s tests -p test_module.py
     if ($LASTEXITCODE -ne 0) {
         throw 'CLI integration specifications failed.'
     }
@@ -29,6 +30,11 @@ try {
     & $Emacs -Q --batch -l tests/neo-term-test.el -f ert-run-tests-batch-and-exit
     if ($LASTEXITCODE -ne 0) {
         throw 'Emacs specifications failed.'
+    }
+
+    & $Emacs -Q --module-assertions --batch -l tests/module-test.el
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Emacs DLL integration specifications failed.'
     }
 
     if ($Gui) {

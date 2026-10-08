@@ -7,6 +7,7 @@
 #include <atomic>
 #include <sstream>
 #include <utility>
+#include <algorithm>
 
 namespace neo {
 inline void wincheck(bool success, const char* operation) {
@@ -67,23 +68,29 @@ inline std::wstring executable_path() {
     return result;
 }
 
-inline void clear_console(HANDLE output) {
-    CONSOLE_SCREEN_BUFFER_INFO information{};
-    wincheck(GetConsoleScreenBufferInfo(output, &information), "GetConsoleScreenBufferInfo");
-    const DWORD cells = static_cast<DWORD>(information.dwSize.X) * information.dwSize.Y;
-    const COORD origin{0, 0};
-    DWORD written = 0;
-    wincheck(FillConsoleOutputCharacterW(output, L' ', cells, origin, &written),
-             "FillConsoleOutputCharacterW");
-    wincheck(FillConsoleOutputAttribute(output, information.wAttributes, cells, origin, &written),
-             "FillConsoleOutputAttribute");
-    wincheck(SetConsoleCursorPosition(output, origin), "SetConsoleCursorPosition");
-}
-
-inline std::wstring resolve_program(const std::wstring& program) {
+inline std::wstring resolve_program(std::wstring program, const std::wstring& directory = {},
+                                    const std::vector<std::wstring>& environment = {}) {
+    std::wstring search;
+    if (!directory.empty()) {
+        if (program.find_first_of(L"/\\") != std::wstring::npos &&
+            program.front() != L'/' && program.front() != L'\\' &&
+            (program.size() < 2 || program[1] != L':')) {
+            program = directory + L"/" + program;
+        }
+        wchar_t system[MAX_PATH];
+        wincheck(GetSystemDirectoryW(system, MAX_PATH) != 0, "Get system directory");
+        search = directory + L';' + system;
+        for (const auto& variable : environment) {
+            if (_wcsnicmp(variable.c_str(), L"PATH=", 5) == 0) {
+                search += L';' + variable.substr(5);
+                break;
+            }
+        }
+    }
     std::wstring path(32768, L'\0');
     const auto length = SearchPathW(
-        nullptr, program.c_str(), L".exe", static_cast<DWORD>(path.size()), path.data(), nullptr);
+        search.empty() ? nullptr : search.c_str(), program.c_str(), L".exe",
+        static_cast<DWORD>(path.size()), path.data(), nullptr);
     wincheck(length && length < path.size(), "Executable lookup");
     path.resize(length);
     return path;
@@ -163,20 +170,27 @@ protected:
         wincheck(SetInformationJobObject(
                      job_.get(), JobObjectExtendedLimitInformation, &limit, sizeof(limit)),
                  "SetInformationJobObject");
-        const auto program = resolve_program(options_.program.front());
+        const auto program = resolve_program(options_.program.front(), options_.directory,
+                                             options_.environment);
         std::wstring command = quote_argument(program);
         for (size_t index = 1; index < options_.program.size(); ++index) {
             command += L' ' + quote_argument(options_.program[index]);
         }
         PROCESS_INFORMATION information{};
+        std::wstring environment;
+        for (const auto& variable : options_.environment) {
+            environment += variable;
+            environment += L'\0';
+        }
+        environment += L'\0';
         wincheck(CreateProcessW(program.c_str(),
                                 command.data(),
                                 nullptr,
                                 nullptr,
                                 inherit,
-                                flags | CREATE_SUSPENDED,
-                                nullptr,
-                                nullptr,
+                                flags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                                options_.environment.empty() ? nullptr : environment.data(),
+                                options_.directory.empty() ? nullptr : options_.directory.c_str(),
                                 &startup.StartupInfo,
                                 &information),
                  "CreateProcessW");
@@ -201,13 +215,74 @@ public:
     virtual Screen snapshot() = 0;
     virtual void command(const Command& command) = 0;
 
+    virtual bool supports_clear() const {
+        return false;
+    }
+
+    virtual bool has_updates() {
+        return true;
+    }
+
+    virtual void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr) {
+        if (interrupt) {
+            WaitForSingleObject(interrupt, timeout);
+        } else {
+            Sleep(timeout);
+        }
+    }
+
+    void set_shell_environment(const std::wstring& pipe, unsigned short port, const std::string& token) {
+        if (options_.environment.empty()) {
+            const auto environment = GetEnvironmentStringsW();
+            wincheck(environment != nullptr, "Read process environment");
+            for (auto entry = environment; *entry; entry += wcslen(entry) + 1) {
+                options_.environment.emplace_back(entry);
+            }
+            FreeEnvironmentStringsW(environment);
+        }
+        auto& variables = options_.environment;
+        variables.erase(std::remove_if(variables.begin(), variables.end(), [](const auto& value) {
+            return _wcsnicmp(value.c_str(), L"NEO_TERM_PIPE=", 14) == 0 ||
+                   _wcsnicmp(value.c_str(), L"NEO_TERM_PORT=", 14) == 0 ||
+                   _wcsnicmp(value.c_str(), L"NEO_TERM_TOKEN=", 15) == 0 ||
+                   _wcsnicmp(value.c_str(), L"NEO_TERM_HOST=", 14) == 0;
+        }), variables.end());
+        variables.push_back(L"NEO_TERM_PIPE=" + pipe);
+        variables.push_back(L"NEO_TERM_PORT=" + std::to_wstring(port));
+        variables.push_back(L"NEO_TERM_TOKEN=" + wide(token));
+        const auto name = [](const std::wstring& value) {
+            return value.substr(0, value.find(L'=', 1));
+        };
+        std::stable_sort(variables.begin(), variables.end(), [&](const auto& left, const auto& right) {
+            return _wcsicmp(name(left).c_str(), name(right).c_str()) < 0;
+        });
+        variables.erase(std::unique(variables.begin(), variables.end(), [&](const auto& left, const auto& right) {
+            return _wcsicmp(name(left).c_str(), name(right).c_str()) == 0;
+        }), variables.end());
+        variables.erase(std::remove_if(variables.begin(), variables.end(), [](const auto& value) {
+            return value.find(L'=', 1) == std::wstring::npos;
+        }), variables.end());
+    }
+
     virtual void shell_notification(const std::string&) {
     }
 
-    virtual void stop() {
+    void terminate_children() {
         if (job_.get()) {
             TerminateJobObject(job_.get(), 0);
         }
+    }
+
+    virtual void begin_exit() {
+        terminate_children();
+    }
+
+    virtual bool output_finished() {
+        return true;
+    }
+
+    virtual void stop() {
+        terminate_children();
     }
 
     virtual std::string runtime() const = 0;
@@ -228,5 +303,4 @@ public:
 };
 
 std::unique_ptr<Backend> make_conpty(const Options& options, bool bundled);
-std::unique_ptr<Backend> make_classic(const Options& options);
 }

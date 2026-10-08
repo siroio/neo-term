@@ -3,7 +3,7 @@
 #include <vector>
 
 namespace neo {
-enum class BackendKind { automatic, bundled, system, classic };
+enum class BackendKind { automatic, bundled, system };
 
 inline std::string backend_name(BackendKind kind) {
     switch (kind) {
@@ -11,8 +11,6 @@ inline std::string backend_name(BackendKind kind) {
         return "bundled-conpty";
     case BackendKind::system:
         return "system-conpty";
-    case BackendKind::classic:
-        return "classic";
     default:
         return "auto";
     }
@@ -24,19 +22,22 @@ struct Options {
     int cols = 80;
     int rows = 24;
     std::vector<std::wstring> program;
+    std::wstring directory;
+    std::wstring runtime_directory;
+    std::vector<std::wstring> environment;
 };
 
 inline std::vector<BackendKind> candidates(const Options& options) {
     if (options.kind != BackendKind::automatic) {
-        if (options.no_conpty && options.kind != BackendKind::classic) {
+        if (options.no_conpty) {
             throw std::runtime_error("Requested ConPTY backend is forbidden");
         }
         return {options.kind};
     }
     if (options.no_conpty) {
-        return {BackendKind::classic};
+        throw std::runtime_error("The DLL requires ConPTY");
     }
-    return {BackendKind::bundled, BackendKind::system, BackendKind::classic};
+    return {BackendKind::bundled, BackendKind::system};
 }
 
 inline Options parse_options(const std::vector<std::wstring>& args) {
@@ -66,8 +67,6 @@ inline Options parse_options(const std::vector<std::wstring>& args) {
                 result.kind = BackendKind::bundled;
             } else if (value == L"system-conpty") {
                 result.kind = BackendKind::system;
-            } else if (value == L"classic") {
-                result.kind = BackendKind::classic;
             } else {
                 throw std::runtime_error("Unknown backend");
             }

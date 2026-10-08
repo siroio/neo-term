@@ -13,21 +13,17 @@ void require(bool value, const char* specification) {
 int main() {
     using namespace neo;
     require(candidates(Options{}) == std::vector<BackendKind>{BackendKind::bundled,
-                                                              BackendKind::system,
-                                                              BackendKind::classic},
-            "auto prefers bundled, system, classic");
+                                                              BackendKind::system},
+            "auto only considers bundled and system ConPTY");
     Options restricted;
     restricted.no_conpty = true;
-    require(candidates(restricted) == std::vector<BackendKind>{BackendKind::classic},
-            "ConPTY prohibition excludes both runtimes");
-    restricted.kind = BackendKind::system;
     bool rejected = false;
     try {
         candidates(restricted);
     } catch (const std::exception&) {
         rejected = true;
     }
-    require(rejected, "an explicitly forbidden backend must fail");
+    require(rejected, "disabling ConPTY cannot select an EXE backend");
     require(quote_argument(L"a b\\") == L"\"a b\\\\\"",
             "trailing backslashes survive Windows argument quoting");
     require(quote_argument(L"a\"b") == L"\"a\\\"b\"",

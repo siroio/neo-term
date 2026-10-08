@@ -2138,6 +2138,19 @@ void vterm_state_reset(VTermState *state, int hard)
   }
 }
 
+void vterm_state_clear_screen(VTermState *state)
+{
+  VTermPos oldpos = state->pos;
+  VTermRect rect = { 0, state->rows, 0, state->cols };
+  erase(state, rect, 0);
+  state->lineinfo[0].continuation = 0;
+  state->pos.row = 0;
+  state->pos.col = 0;
+  state->at_phantom = 0;
+  state->combine_pos.row = -1;
+  updatecursor(state, &oldpos, 0);
+}
+
 void vterm_state_get_cursorpos(const VTermState *state, VTermPos *cursorpos)
 {
   *cursorpos = state->pos;

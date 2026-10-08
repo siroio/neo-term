@@ -1,5 +1,5 @@
 /build/*
-!/build/neo-term-host.exe
+!/build/neo-term-module.dll
 var/
 *.elc
 vendor/*.tar.gz

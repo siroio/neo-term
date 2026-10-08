@@ -34,7 +34,71 @@ static void require(bool value, const char* specification) {
     }
 }
 
+static int record_title(VTermProp property, VTermValue* value, void* user) {
+    if (property == VTERM_PROP_TITLE) {
+        auto& title = *static_cast<std::string*>(user);
+        if (value->string.initial) {
+            title.clear();
+        }
+        title.append(value->string.str, value->string.len);
+    }
+    return 1;
+}
+
 int main() {
+    auto clear_terminal = vterm_new(3, 10);
+    auto clear_screen = vterm_obtain_screen(clear_terminal);
+    vterm_set_utf8(clear_terminal, 1);
+    vterm_screen_reset(clear_screen, 1);
+    const char* partial_color = "old\x1b[31";
+    vterm_input_write(clear_terminal, partial_color, std::strlen(partial_color));
+    vterm_state_clear_screen(vterm_obtain_state(clear_terminal));
+    vterm_input_write(clear_terminal, "mX", 2);
+    VTermScreenCell clear_cell{};
+    vterm_screen_get_cell(clear_screen, {0, 0}, &clear_cell);
+    require(clear_cell.chars[0] == 'X',
+            "screen clear preserves a color sequence split between output reads");
+    require(clear_cell.fg.type & VTERM_COLOR_INDEXED && clear_cell.fg.indexed.idx == 1,
+            "the pending foreground color is applied after screen clear");
+    std::string title;
+    VTermScreenCallbacks clear_callbacks{};
+    clear_callbacks.settermprop = record_title;
+    vterm_screen_set_callbacks(clear_screen, &clear_callbacks, &title);
+    const char* partial_title = "\x1b]0;partial";
+    vterm_input_write(clear_terminal, partial_title, std::strlen(partial_title));
+    vterm_state_clear_screen(vterm_obtain_state(clear_terminal));
+    vterm_input_write(clear_terminal, "rest\x07Z", 6);
+    require(title == "partialrest", "screen clear preserves a title split between output reads");
+    vterm_screen_get_cell(clear_screen, {0, 0}, &clear_cell);
+    require(clear_cell.chars[0] == 'Z', "title fragments remain control data after screen clear");
+    vterm_free(clear_terminal);
+    auto unicode_terminal = vterm_new(2, 20);
+    auto unicode_screen = vterm_obtain_screen(unicode_terminal);
+    vterm_set_utf8(unicode_terminal, 1);
+    vterm_screen_reset(unicode_screen, 1);
+    const char* unicode_text = "e\u1AB0B";
+    vterm_input_write(unicode_terminal, unicode_text, std::strlen(unicode_text));
+    VTermPos unicode_cursor{};
+    vterm_state_get_cursorpos(vterm_obtain_state(unicode_terminal), &unicode_cursor);
+    require(unicode_cursor.col == 2, "new combining marks do not advance the cursor");
+    VTermScreenCell unicode_cell{};
+    vterm_screen_get_cell(unicode_screen, {0, 0}, &unicode_cell);
+    require(unicode_cell.chars[0] == 'e' && unicode_cell.chars[1] == 0x1AB0,
+            "new combining marks remain attached to their base character");
+    vterm_screen_reset(unicode_screen, 1);
+    unicode_text = "A🫩B";
+    vterm_input_write(unicode_terminal, unicode_text, std::strlen(unicode_text));
+    vterm_state_get_cursorpos(vterm_obtain_state(unicode_terminal), &unicode_cursor);
+    vterm_screen_get_cell(unicode_screen, {0, 1}, &unicode_cell);
+    require(unicode_cursor.col == 4 && unicode_cell.width == 2,
+            "Unicode 16 emoji occupy two terminal cells");
+    vterm_screen_reset(unicode_screen, 1);
+    unicode_text = "日\u302AB";
+    vterm_input_write(unicode_terminal, unicode_text, std::strlen(unicode_text));
+    vterm_state_get_cursorpos(vterm_obtain_state(unicode_terminal), &unicode_cursor);
+    require(unicode_cursor.col == 3,
+            "wide-category combining marks do not consume another cell");
+    vterm_free(unicode_terminal);
     auto terminal = vterm_new(2, 4);
     auto screen = vterm_obtain_screen(terminal);
     vterm_set_utf8(terminal, 1);

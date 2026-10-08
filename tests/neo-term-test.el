@@ -347,8 +347,7 @@
 
 (ert-deftest neo-term-real-cmd-output-reaches-emacs-buffer ()
   (should (fboundp 'neo-term))
-  (let* ((neo-term-host-program (expand-file-name "build/neo-term-host.exe" neo-term-test-root))
-         (neo-term-backend 'system-conpty)
+  (let* ((neo-term-backend 'system-conpty)
          (neo-term-shell "cmd.exe")
          (neo-term-shell-arguments '("/Q"))
          (buffer (neo-term)))

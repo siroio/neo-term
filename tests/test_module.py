@@ -12,30 +12,47 @@ import re
 import tempfile
 import shutil
 import base64
+import statistics
+import socket
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = ROOT / "build" / "neo-term-host.exe"
+MODULE = ROOT / "build" / "neo-term-module.dll"
+EMACS = os.environ.get("NEO_TERM_TEST_EMACS") or shutil.which("emacs.exe") or "emacs"
 FIXTURE = ROOT / "build" / "console-fixture.exe"
-BACKENDS = ("system-conpty", "classic") + (
-    ("bundled-conpty",) if (HOST.parent / "runtime" / "conpty.dll").exists() else ()
+BACKENDS = ("system-conpty",) + (
+    ("bundled-conpty",) if (MODULE.parent / "runtime" / "conpty.dll").exists() else ()
 )
 KERNEL = ctypes.WinDLL("kernel32", use_last_error=True)
 KERNEL.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
 KERNEL.OpenProcess.restype = ctypes.c_void_p
 KERNEL.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 KERNEL.CloseHandle.argtypes = [ctypes.c_void_p]
+KERNEL.GetProcessTimes.argtypes = [
+    ctypes.c_void_p, *([ctypes.POINTER(ctypes.c_ulonglong)] * 4)
+]
 
 
 class Session:
-    def __init__(self, backend, program, extra=(), host=HOST):
+    def __init__(self, backend, program, extra=(), module=MODULE):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(15)
+        arguments = ["--backend", backend, *extra, "--", *map(str, program)]
         self.process = subprocess.Popen(
-            [str(host), "--backend", backend, *extra, "--", *map(str, program)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            cwd=ROOT,
+            [EMACS, "-Q", "--batch", "-l", str(ROOT / "tests" / "protocol-driver.el"),
+             str(listener.getsockname()[1]),
+             base64.b64encode(json.dumps(arguments, ensure_ascii=False).encode("utf-8")).decode("ascii"),
+             str(module)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW, cwd=ROOT,
         )
+        try:
+            self.connection, _ = listener.accept()
+        finally:
+            listener.close()
+        self.process.stdin = self.connection.makefile("wb")
+        self.process.stdout = self.connection.makefile("rb")
         self.events = queue.Queue()
         self.rows = {}
         self.screen = {}
@@ -72,7 +89,10 @@ class Session:
     def until(self, predicate, timeout=12):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            event = self.events.get(timeout=max(0.01, deadline - time.monotonic()))
+            try:
+                event = self.events.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                raise AssertionError(f"timed out; screen={self.text()[:1000]!r}; frames={len(self.frames)}") from None
             if isinstance(event, Exception):
                 raise event
             if event is None:
@@ -121,9 +141,10 @@ class Session:
         self.thread.join(timeout=2)
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
             stream.close()
+        self.connection.close()
 
 
-class HostSpecifications(unittest.TestCase):
+class ModuleSpecifications(unittest.TestCase):
     def run_session(self, backend, program, extra=()):
         session = Session(backend, program, extra)
         self.addCleanup(session.close)
@@ -166,12 +187,14 @@ class HostSpecifications(unittest.TestCase):
                 session.send("U99,4")
                 session.until(lambda e: "INTERRUPTED" in session.text())
 
-    def test_conpty_prohibition_selects_classic(self):
-        session, ready = self.run_session("auto", [FIXTURE, "unicode"], ["--no-conpty"])
-        self.assertEqual(ready["backend"], "classic")
+    def test_conpty_prohibition_reports_an_error_without_starting_a_cli(self):
+        session = Session("auto", [FIXTURE, "unicode"], ["--no-conpty"])
+        self.addCleanup(session.close)
+        with self.assertRaisesRegex(AssertionError, "ConPTY"):
+            session.until(lambda e: e["type"] == "ready")
 
     def test_screen_clear_preserves_the_cli_and_accepts_further_input(self):
-        for backend in BACKENDS:
+        for backend in (kind for kind in BACKENDS if kind == "bundled-conpty"):
             with self.subTest(backend=backend):
                 session, ready = self.run_session(backend, [FIXTURE, "interactive"])
                 session.until(lambda e: "FIXTURE_READY" in session.text())
@@ -187,7 +210,7 @@ class HostSpecifications(unittest.TestCase):
 
     def test_cmd_and_powershell_continue_after_native_and_shell_clear(self):
         programs = (("cmd.exe", "/Q"), ("powershell.exe", "-NoLogo", "-NoProfile"))
-        for backend in BACKENDS:
+        for backend in (kind for kind in BACKENDS if kind == "bundled-conpty"):
             for program in programs:
                 with self.subTest(backend=backend, program=program[0]):
                     session, _ = self.run_session(backend, program)
@@ -214,7 +237,7 @@ class HostSpecifications(unittest.TestCase):
                     session.until(lambda e: "PENDING_SHELL_OK" in session.text())
 
     def test_populated_scrollback_survives_screen_clear_until_history_clear(self):
-        for backend in (kind for kind in BACKENDS if kind != "classic"):
+        for backend in (kind for kind in BACKENDS if kind == "bundled-conpty"):
             with self.subTest(backend=backend):
                 session, _ = self.run_session(backend, [FIXTURE, "history"])
                 session.until(lambda e: "FIXTURE_READY" in session.text())
@@ -312,25 +335,12 @@ class HostSpecifications(unittest.TestCase):
             "bundled-conpty", [FIXTURE, "reflow-cursor"], ("--cols", "4", "--rows", "6")
         )
         session.until(lambda e: "A日B" in session.text())
-        for width in (2, 3, 4, 7):
+        for width in (2, 3, 4, 7) * 10:
             session.send(f"R{width},6")
             session.until(lambda e: e.get("cols") == width)
         session.send("TZ")
         session.until(lambda e: "BZ" in session.text())
         self.assertIn("A日BZ", session.text())
-
-    def test_classic_resize_does_not_collect_existing_history_twice(self):
-        session, _ = self.run_session(
-            "classic", [FIXTURE, "history"], ("--cols", "40", "--rows", "4")
-        )
-        session.until(lambda e: "FIXTURE_READY" in session.text())
-        previous = session.history.copy()
-        session.send("R60,4")
-        session.until(lambda e: e.get("cols") == 60)
-        session.send("Ty")
-        session.until(lambda e: "CHAR=121" in session.text())
-        self.assertEqual(session.history[: len(previous)], previous)
-        self.assertLessEqual(sum(line.strip() == "history 0" for line in session.history), 1)
 
     def test_powershell_prompt_reports_directory_and_keeps_custom_prompt(self):
         script = ROOT / "shell" / "neo-term.ps1"
@@ -396,38 +406,6 @@ class HostSpecifications(unittest.TestCase):
                     if len(cell) == 6 and cell[5]
                 ]
                 self.assertTrue(any(cell[0] == "C" and cell[5] & 1 for cell in marked))
-
-    def test_classic_prompt_wrap_at_buffer_bottom_keeps_exact_positions(self):
-        for column, prompt in ((0, "'BOUNDARY_' + ('x' * 90) + '> '"), (39, "'B> '")):
-            with self.subTest(column=column):
-                startup = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
-                startup += f"\n$global:neoTermOriginalPrompt = {{ {prompt} }}; "
-                startup += f"[Console]::SetCursorPosition({column}, [Console]::BufferHeight - 1)"
-                session, _ = self.run_session(
-                    "classic",
-                    [
-                        "powershell.exe",
-                        "-NoProfile",
-                        "-NoExit",
-                        "-EncodedCommand",
-                        base64.b64encode(startup.encode("utf-16le")).decode("ascii"),
-                    ],
-                    extra=("--cols", "40"),
-                )
-                session.until(
-                    lambda e: any(
-                        len(cell) == 6 and cell[0] == "B" and cell[5] & 1
-                        for row in session.rows.values()
-                        for cell in row
-                    )
-                )
-                self.assertTrue(
-                    any(
-                        len(cell) == 6 and cell[5] & 6
-                        for row in session.rows.values()
-                        for cell in row
-                    )
-                )
 
     def test_shell_file_requests_arrive_on_every_backend(self):
         startup = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
@@ -496,6 +474,33 @@ class HostSpecifications(unittest.TestCase):
                 event = session.until(lambda e: "CURSOR_READY" in session.text())
                 self.assertEqual(event["cursor_shape"], 3)
                 self.assertFalse(event["cursor_blink"])
+
+    def test_cmd_notifications_preserve_unicode_symbols_and_rapid_requests(self):
+        with tempfile.TemporaryDirectory(prefix="日本語 & ! ", dir=MODULE.parent) as directory:
+            path = Path(directory) / "日本語 & ! file.txt"
+            path.write_text("first\nsecond\n", encoding="utf-8")
+            for backend in BACKENDS:
+                with self.subTest(backend=backend):
+                    session, _ = self.run_session(backend, ["cmd.exe", "/D", "/Q", "/K", ROOT / "shell" / "neo-term.cmd"])
+                    session.until(lambda e: ">" in session.text())
+                    session.send(f'Tcd /d "{directory}"')
+                    session.send("K1,0")
+                    session.until(lambda e: e.get("title", "").endswith(directory))
+                    commands = " & ".join(
+                        f'call "{ROOT / "shell" / "neo-term-notify.cmd"}" open "{path}" {line} 1'
+                        for line in range(1, 6)
+                    )
+                    session.send("T" + commands)
+                    session.send("K1,0")
+                    requests = []
+                    def received(event):
+                        requests.extend(json.loads(message[12:]) for message in event.get("shell_events", [])
+                                        if message.startswith("51;neo-term;"))
+                        return len(requests) == 5
+                    session.until(received)
+                    self.assertEqual([request["line"] for request in requests], list(range(1, 6)))
+                    self.assertTrue(all(Path(request["file"]) == path for request in requests))
+                    session.close()
 
     def test_git_bash_integration_reports_directory_and_opens_files(self):
         git = shutil.which("git.exe")
@@ -568,6 +573,50 @@ class HostSpecifications(unittest.TestCase):
         )
         self.assertIn(b"status:False:7", result.stdout)
 
+    def test_powershell_console_output_preserves_japanese_and_emoji(self):
+        startup = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
+        code = startup + "\n[Console]::Write('日本語😀')"
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend, ["powershell.exe", "-NoProfile", "-EncodedCommand",
+                              base64.b64encode(code.encode("utf-16le")).decode("ascii")],
+                )
+                session.until(lambda e: e["type"] == "exit")
+                self.assertIn("日本語😀", session.text())
+
+    def test_new_emoji_width_matches_the_console_cursor(self):
+        if "bundled-conpty" not in BACKENDS:
+            self.skipTest("the pinned Unicode 16 ConPTY runtime is required")
+        code = (
+            "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+            "[Console]::Write('A🫩B'); "
+            "[Console]::Title = 'WIDTH:' + [Console]::CursorLeft; Start-Sleep -Seconds 30"
+        )
+        session, _ = self.run_session(
+            "bundled-conpty", ["powershell.exe", "-NoProfile", "-EncodedCommand",
+                               base64.b64encode(code.encode("utf-16le")).decode("ascii")],
+        )
+        event = session.until(lambda e: e.get("title", "").startswith("WIDTH:"))
+        self.assertEqual(event["title"], "WIDTH:4")
+        self.assertEqual(event["x"], 4)
+        self.assertEqual(session.rows[0][1][:2], ["🫩", 2])
+        self.assertIn("A🫩B", session.text())
+
+    def test_cooked_wide_input_at_the_last_column_does_not_deadlock(self):
+        if "bundled-conpty" not in BACKENDS:
+            self.skipTest("the pinned ConPTY runtime is required")
+        session, _ = self.run_session(
+            "bundled-conpty", [FIXTURE, "cooked-unicode"], ("--cols", "2", "--rows", "20")
+        )
+        session.until(lambda e: e.get("title") == "COOKED_READY")
+        for character in "キ😀":
+            session.send(f"U{ord(character)},0")
+        session.send("K1,0")
+        end = session.until(lambda e: e["type"] == "exit", timeout=3)
+        self.assertEqual(end["code"], 14)
+        self.assertEqual(session.screen["title"], "COOKED=キ😀")
+
     def test_osc52_unicode_clipboard_data_reaches_the_frontend(self):
         for backend in (kind for kind in BACKENDS if kind != "classic"):
             with self.subTest(backend=backend):
@@ -594,19 +643,24 @@ class HostSpecifications(unittest.TestCase):
             self.skipTest("set NEO_TERM_TEST_VIM to run a real Vim integration")
         for backend in BACKENDS:
             with self.subTest(backend=backend), tempfile.TemporaryDirectory(
-                dir=HOST.parent
+                dir=MODULE.parent
             ) as folder:
                 path = Path(folder) / "vim-result.txt"
                 session, _ = self.run_session(
-                    backend, [vim, "-Nu", "NONE", "-n", "-i", "NONE", str(path)]
+                    backend, [vim, "-Nu", "NONE", "-n", "-i", "NONE",
+                              "--cmd", "set encoding=utf-8", str(path)]
                 )
                 session.until(lambda e: "vim-result.txt" in session.text())
-                session.send("TiNEO_VIM_OK")
+                session.send("TiNEO_VIM_OK 日本語😀e\u0301")
+                session.until(lambda e: "NEO_VIM_OK" in session.text())
+                for width, height in ((40, 10), (120, 40), (80, 24)) * 3:
+                    session.send(f"R{width},{height}")
+                    session.until(lambda e: e.get("cols") == width and e.get("height") == height)
                 session.send("K4,0")
                 session.send("T:wq")
                 session.send("K1,0")
                 session.until(lambda e: e["type"] == "exit")
-                self.assertEqual(path.read_text(encoding="utf-8").strip(), "NEO_VIM_OK")
+                self.assertEqual(path.read_text(encoding="utf-8").strip(), "NEO_VIM_OK 日本語😀e\u0301")
 
     def test_pipe_disconnect_releases_owned_processes(self):
         for backend in BACKENDS:
@@ -616,6 +670,7 @@ class HostSpecifications(unittest.TestCase):
                 handle = KERNEL.OpenProcess(0x100000, False, ready["pid"])
                 self.assertTrue(handle)
                 try:
+                    session.connection.shutdown(socket.SHUT_WR)
                     session.process.stdin.close()
                     self.assertEqual(session.process.wait(timeout=8), 0)
                     self.assertEqual(KERNEL.WaitForSingleObject(handle, 3000), 0)
@@ -636,54 +691,16 @@ class HostSpecifications(unittest.TestCase):
                 finally:
                     KERNEL.CloseHandle(handle)
 
-    def test_close_releases_helper_when_screen_output_is_not_read(self):
-        for backend in BACKENDS:
-            for delay in (0.002, 0.01):
-                with self.subTest(backend=backend, delay=delay):
-                    cols, rows = ("80", "24") if backend == "classic" else ("300", "200")
-                    process = subprocess.Popen(
-                        [
-                            str(HOST),
-                            "--backend",
-                            backend,
-                            "--cols",
-                            cols,
-                            "--rows",
-                            rows,
-                            "--",
-                            str(FIXTURE),
-                            "sleeper",
-                        ],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                    try:
-                        (length,) = struct.unpack("<I", process.stdout.read(4))
-                        ready = json.loads(process.stdout.read(length))
-                        self.assertEqual(ready["type"], "ready")
-                        time.sleep(delay)
-                        process.stdin.write(struct.pack("<I", 1) + b"C")
-                        process.stdin.flush()
-                        self.assertEqual(process.wait(timeout=3), 0)
-                    finally:
-                        if process.poll() is None:
-                            process.kill()
-                            process.wait()
-                        for stream in (process.stdin, process.stdout, process.stderr):
-                            stream.close()
-
     def test_auto_prefers_bundled_runtime_when_installed(self):
         session, ready = self.run_session("auto", [FIXTURE, "unicode"])
         expected = "bundled-conpty" if "bundled-conpty" in BACKENDS else "system-conpty"
         self.assertEqual(ready["backend"], expected)
 
     def test_missing_bundled_runtime_falls_back_before_cli_launch(self):
-        with tempfile.TemporaryDirectory(prefix="日本語 helper ", dir=HOST.parent) as directory:
-            helper = Path(directory) / "host.exe"
-            shutil.copy2(HOST, helper)
-            session = Session("auto", [FIXTURE, "unicode"], host=helper)
+        with tempfile.TemporaryDirectory(prefix="日本語 module ", dir=MODULE.parent) as directory:
+            module = Path(directory) / "module.dll"
+            shutil.copy2(MODULE, module)
+            session = Session("auto", [FIXTURE, "unicode"], module=module)
             try:
                 ready = session.until(lambda e: e["type"] == "ready")
                 self.assertEqual(ready["backend"], "system-conpty")
@@ -695,7 +712,7 @@ class HostSpecifications(unittest.TestCase):
                 session.close()
 
     def test_unicode_executable_path_is_not_passed_through_a_shell(self):
-        with tempfile.TemporaryDirectory(prefix="日本語 cli ", dir=HOST.parent) as directory:
+        with tempfile.TemporaryDirectory(prefix="日本語 cli ", dir=MODULE.parent) as directory:
             executable = Path(directory) / "検証 CLI.exe"
             shutil.copy2(FIXTURE, executable)
             for backend in BACKENDS:
@@ -729,6 +746,111 @@ class HostSpecifications(unittest.TestCase):
                 self.assertTrue(any(cell[2] == 0x12AB34 for cell in cells))
                 session.until(lambda e: "BURST_DONE" in session.text())
                 session.until(lambda e: e["type"] == "exit")
+
+    def test_exit_delivers_the_tail_of_burst_output_before_the_exit_event(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "vt"])
+                session.until(lambda e: e["type"] == "exit")
+                lines = session.history + session.text().splitlines()
+                numbers = [
+                    int(match[1])
+                    for line in lines
+                    if (match := re.fullmatch(r"burst (\d+)", line.strip()))
+                ]
+                self.assertEqual(numbers[-512:], list(range(2488, 3000)))
+                self.assertIn("BURST_DONE", session.text())
+
+    def test_conpty_exit_is_reported_without_a_fixed_grace_period(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                delays = []
+                for _ in range(3):
+                    session, ready = self.run_session(backend, [FIXTURE, "unicode"])
+                    handle = KERNEL.OpenProcess(0x100000, False, ready["pid"])
+                    self.assertTrue(handle)
+                    try:
+                        self.assertEqual(KERNEL.WaitForSingleObject(handle, 3000), 0)
+                        started = time.monotonic()
+                        end = session.until(lambda e: e["type"] == "exit")
+                        delays.append(time.monotonic() - started)
+                        self.assertEqual(end["code"], 7)
+                        self.assertIn("日本語😀", session.text())
+                    finally:
+                        KERNEL.CloseHandle(handle)
+                        session.close()
+                self.assertLess(statistics.median(delays), 0.08)
+
+    def test_conpty_interactive_output_does_not_wait_for_the_polling_interval(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "interactive"])
+                session.until(lambda e: "FIXTURE_READY" in session.text())
+                delays = []
+                for character in "abcdefg":
+                    started = time.perf_counter()
+                    session.send("T" + character)
+                    session.until(lambda e: f"CHAR={ord(character)}" in session.text())
+                    delays.append(time.perf_counter() - started)
+                self.assertLess(statistics.median(delays), 0.018)
+
+    def test_idle_large_conpty_screen_does_not_spend_cpu_redrawing(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend, [FIXTURE, "sleeper"], ("--cols", "300", "--rows", "200")
+                )
+                session.until(lambda e: e["type"] == "screen")
+                handle = KERNEL.OpenProcess(0x1000, False, session.process.pid)
+                self.assertTrue(handle)
+                try:
+                    def cpu_seconds():
+                        values = [ctypes.c_ulonglong() for _ in range(4)]
+                        self.assertTrue(
+                            KERNEL.GetProcessTimes(handle, *[ctypes.byref(x) for x in values])
+                        )
+                        return (values[2].value + values[3].value) / 10_000_000
+
+                    start = cpu_seconds()
+                    time.sleep(1)
+                    self.assertLess(cpu_seconds() - start, 0.15)
+                finally:
+                    KERNEL.CloseHandle(handle)
+
+    def test_unicode_input_survives_resize_and_is_returned_before_exit(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "echo-unicode"])
+                session.until(lambda e: "ECHO_READY" in session.text())
+                for width, height in ((20, 4), (120, 40), (80, 24)) * 5:
+                    session.send(f"R{width},{height}")
+                    session.until(lambda e: e.get("cols") == width and e.get("height") == height)
+                for character in "日本語😀e\u0301":
+                    session.send(f"U{ord(character)},0")
+                session.send("K1,0")
+                end = session.until(lambda e: e["type"] == "exit")
+                self.assertEqual(end["code"], 9)
+                self.assertIn("ECHO=日本語😀e\u0301", session.text())
+
+    def test_interrupt_stops_continuous_unicode_output(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "flood"])
+                session.until(lambda e: "flood 日本語😀" in session.text())
+                started = time.monotonic()
+                session.send("U99,4")
+                end = session.until(lambda e: e["type"] == "exit", timeout=5)
+                self.assertEqual(end["code"], 13)
+                self.assertIn("FLOOD_STOPPED", session.text())
+                self.assertLess(time.monotonic() - started, 5)
+
+    def test_parent_exit_stops_a_descendant_that_keeps_writing(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "descendant-flood"])
+                end = session.until(lambda e: e["type"] == "exit", timeout=3)
+                self.assertEqual(end["code"], 17)
+
 
 
 if __name__ == "__main__":

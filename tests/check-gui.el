@@ -10,7 +10,11 @@
       (accept-process-output nil .05)
       (sit-for .02))
     (unless (funcall predicate)
-      (error "GUI terminal wait timed out: %s" neo-term--status))))
+      (error "GUI terminal wait timed out: %s; %S; %s" neo-term--status predicate
+             (substring-no-properties (buffer-string) 0 (min 1500 (buffer-size)))))
+    (when (and neo-term--session (not (equal (alist-get 'backend neo-term--session) "classic")))
+      (unless (process-get neo-term--process 'neo-term-module)
+        (error "GUI ConPTY session did not use the DLL")))))
 (condition-case failure
     (progn
       (unless (display-graphic-p)
@@ -104,7 +108,7 @@
           (when (buffer-live-p visiting) (kill-buffer visiting))
           (kill-buffer buffer)
           (delete-file file)))
-      (dolist (backend (append '(system-conpty classic)
+      (dolist (backend (append '(system-conpty)
                                (when (file-exists-p (expand-file-name
                                                      "build/runtime/conpty.dll"
                                                      neo-term-gui-root)) '(bundled-conpty))))
@@ -153,10 +157,13 @@
                         (delete-region (point-min) (point-max)))
                       (error "Terminal display was editable"))
                   (user-error nil))
-                (execute-kbd-macro (kbd "C-l"))
+                (if (alist-get 'clear neo-term--session)
+                    (execute-kbd-macro (kbd "C-l"))
+                  (condition-case nil (progn (neo-term-clear) (error "Unsupported clear did not fail"))
+                    (user-error (neo-term--resume-input))))
                 (when neo-term--copy (error "Clear did not resume input mode"))
-                (neo-term-gui-wait
-                 (lambda () (string-empty-p (string-trim (buffer-string)))))
+                (when (alist-get 'clear neo-term--session)
+                  (neo-term-gui-wait (lambda () (string-empty-p (string-trim (buffer-string))))))
                 (execute-kbd-macro "z")
                 (neo-term-gui-wait
                  (lambda () (string-match-p "CHAR=122" (buffer-string))))
@@ -187,7 +194,7 @@
                                                             (buffer-string))))))
               (when (buffer-live-p buffer)
                 (kill-buffer buffer))))))
-      (dolist (backend '(system-conpty classic bundled-conpty))
+      (dolist (backend '(system-conpty bundled-conpty))
         (when (or (not (eq backend 'bundled-conpty))
                   (file-exists-p (expand-file-name "build/runtime/conpty.dll" neo-term-gui-root)))
           (let* ((neo-term-backend backend)

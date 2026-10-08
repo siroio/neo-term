@@ -4,6 +4,19 @@
 #include <wincrypt.h>
 
 namespace neo {
+class Socket {
+    SOCKET value_ = INVALID_SOCKET;
+public:
+    Socket() = default;
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    ~Socket() { reset(); }
+    SOCKET get() const { return value_; }
+    void reset(SOCKET value = INVALID_SOCKET) {
+        if (value_ != INVALID_SOCKET) { closesocket(value_); }
+        value_ = value;
+    }
+};
 inline std::wstring environment_value(const wchar_t* name) {
     const auto length = GetEnvironmentVariableW(name, nullptr, 0);
     if (!length) {
@@ -15,6 +28,11 @@ inline std::wstring environment_value(const wchar_t* name) {
 }
 
 class ShellBridge {
+    Socket listener_, connection_;
+    std::string token_, pending_;
+    unsigned short port_ = 0;
+    ULONGLONG deadline_ = 0;
+    std::wstring name_;
     Handle pipe_;
     Handle event_;
     OVERLAPPED operation_{};
@@ -51,10 +69,26 @@ class ShellBridge {
     }
 
 public:
-    ShellBridge() {
-        const auto name = L"neo-term-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                          std::to_wstring(GetTickCount64());
-        const auto path = L"\\\\.\\pipe\\" + name;
+    explicit ShellBridge(std::string token) : token_(std::move(token)) {
+        listener_.reset(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+        wincheck(listener_.get() != INVALID_SOCKET, "Create shell notification socket");
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        wincheck(bind(listener_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+                 "Bind shell notification socket");
+        int size = sizeof(address);
+        wincheck(getsockname(listener_.get(), reinterpret_cast<sockaddr*>(&address), &size) == 0,
+                 "Read shell notification port");
+        port_ = ntohs(address.sin_port);
+        wincheck(listen(listener_.get(), 4) == 0, "Listen for shell notification");
+        u_long nonblocking = 1;
+        wincheck(ioctlsocket(listener_.get(), FIONBIO, &nonblocking) == 0,
+                 "Set shell notification socket mode");
+        static std::atomic<unsigned long> sequence{0};
+        name_ = L"neo-term-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                std::to_wstring(++sequence);
+        const auto path = L"\\\\.\\pipe\\" + name_;
         pipe_.reset(CreateNamedPipeW(
             path.c_str(),
             PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
@@ -67,10 +101,43 @@ public:
         wincheck(pipe_.get() != INVALID_HANDLE_VALUE, "Create shell notification pipe");
         event_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         wincheck(event_.get() != nullptr, "Create shell notification event");
-        wincheck(SetEnvironmentVariableW(L"NEO_TERM_PIPE", name.c_str()), "Set shell pipe");
-        wincheck(SetEnvironmentVariableW(L"NEO_TERM_HOST", executable_path().c_str()),
-                 "Set shell helper");
         connect();
+    }
+
+    const std::wstring& name() const {
+        return name_;
+    }
+
+    unsigned short port() const { return port_; }
+
+    std::string poll_socket() {
+        if (connection_.get() == INVALID_SOCKET) {
+            connection_.reset(accept(listener_.get(), nullptr, nullptr));
+            if (connection_.get() == INVALID_SOCKET) { return {}; }
+            u_long nonblocking = 1;
+            ioctlsocket(connection_.get(), FIONBIO, &nonblocking);
+            pending_.clear();
+            deadline_ = GetTickCount64() + 2000;
+        }
+        char bytes[4096];
+        while (pending_.size() <= 16449 && GetTickCount64() < deadline_) {
+            const int length = recv(connection_.get(), bytes, sizeof(bytes), 0);
+            if (length > 0) {
+                pending_.append(bytes, length);
+                continue;
+            }
+            if (length < 0 && WSAGetLastError() == WSAEWOULDBLOCK) { return {}; }
+            connection_.reset();
+            if (length == 0 && pending_.size() <= 16449 &&
+                pending_.compare(0, token_.size() + 1, token_ + '\n') == 0) {
+                return pending_.substr(token_.size() + 1);
+            }
+            pending_.clear();
+            return {};
+        }
+        connection_.reset();
+        pending_.clear();
+        return {};
     }
 
     ~ShellBridge() {
@@ -80,6 +147,8 @@ public:
     }
 
     std::string poll() {
+        const auto message = poll_socket();
+        if (!message.empty()) { return message; }
         DWORD received = 0;
         if (connecting_ || reading_) {
             if (!GetOverlappedResult(pipe_.get(), &operation_, &received, FALSE)) {
@@ -109,98 +178,4 @@ public:
     }
 };
 
-inline void send_shell_notification(const std::string& message) {
-    const auto name = environment_value(L"NEO_TERM_PIPE");
-    if (name.empty() || message.size() > 16384) {
-        throw std::runtime_error("Not inside a neo-term session or notification too large");
-    }
-    const auto path = L"\\\\.\\pipe\\" + name;
-    Handle connection;
-    const auto deadline = GetTickCount64() + 2000;
-    while (GetTickCount64() < deadline) {
-        connection.reset(
-            CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
-        if (connection.get() != INVALID_HANDLE_VALUE) {
-            break;
-        }
-        if (GetLastError() != ERROR_PIPE_BUSY) {
-            wincheck(false, "Connect shell notification pipe");
-        }
-        WaitNamedPipeW(path.c_str(), 100);
-    }
-    wincheck(connection.get() != INVALID_HANDLE_VALUE, "Connect shell notification pipe");
-    DWORD written = 0;
-    wincheck(WriteFile(connection.get(),
-                       message.data(),
-                       static_cast<DWORD>(message.size()),
-                       &written,
-                       nullptr) &&
-                 written == message.size(),
-             "Send shell notification");
-}
-
-inline int shell_helper(int argc, wchar_t** argv) {
-    try {
-        const std::wstring action = argc > 2 ? argv[2] : L"";
-        if (action == L"open" && argc >= 4 && argc <= 6) {
-            std::wstring path(32768, L'\0');
-            const auto length =
-                GetFullPathNameW(argv[3], static_cast<DWORD>(path.size()), path.data(), nullptr);
-            wincheck(length > 0 && length < path.size(), "Resolve file path");
-            path.resize(length);
-            const auto line = argc > 4 ? integer(utf8(argv[4])) : 1;
-            const auto column = argc > 5 ? integer(utf8(argv[5])) : 1;
-            if (line < 1 || column < 1) {
-                throw std::runtime_error("Line and column must be positive");
-            }
-            send_shell_notification("51;neo-term;{\"file\":" + json_string(utf8(path)) +
-                                    ",\"line\":" + std::to_string(line) +
-                                    ",\"column\":" + std::to_string(column) + '}');
-        } else if (action == L"event" && argc == 4) {
-            send_shell_notification(utf8(argv[3]));
-        } else if (action == L"encoded" && argc == 4) {
-            const auto encoded = utf8(argv[3]);
-            DWORD size = 0;
-            wincheck(CryptStringToBinaryA(encoded.c_str(),
-                                          static_cast<DWORD>(encoded.size()),
-                                          CRYPT_STRING_BASE64,
-                                          nullptr,
-                                          &size,
-                                          nullptr,
-                                          nullptr),
-                     "Decode shell notification size");
-            if (size > 16384) {
-                throw std::runtime_error("Shell notification too large");
-            }
-            std::string message(size, '\0');
-            wincheck(CryptStringToBinaryA(encoded.c_str(),
-                                          static_cast<DWORD>(encoded.size()),
-                                          CRYPT_STRING_BASE64,
-                                          reinterpret_cast<BYTE*>(message.data()),
-                                          &size,
-                                          nullptr,
-                                          nullptr),
-                     "Decode shell notification");
-            send_shell_notification(message);
-        } else if (action == L"cwd" && argc == 3) {
-            std::wstring directory(32768, L'\0');
-            directory.resize(
-                GetCurrentDirectoryW(static_cast<DWORD>(directory.size()), directory.data()));
-            send_shell_notification("cwd;" + utf8(directory));
-        } else {
-            throw std::runtime_error(
-                "Usage: --notify open FILE [LINE [COLUMN]] | event TEXT | cwd");
-        }
-        return 0;
-    } catch (const std::exception& error) {
-        const auto message = std::string("neo-term: ") + error.what() + '\n';
-        DWORD written = 0;
-        WriteFile(GetStdHandle(STD_ERROR_HANDLE),
-                  message.data(),
-                  static_cast<DWORD>(message.size()),
-                  &written,
-                  nullptr);
-        return 1;
-    }
-}
 }

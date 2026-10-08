@@ -10,17 +10,19 @@ class Conpty final : public Backend {
     using Create = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
     using Resize = HRESULT(WINAPI*)(HPCON, COORD);
     using Close = void(WINAPI*)(HPCON);
+    using Clear = HRESULT(WINAPI*)(HPCON, BOOL);
     HMODULE library_ = nullptr;
     Create create_ = nullptr;
     Resize resize_ = nullptr;
     Close close_ = nullptr;
+    Clear clear_ = nullptr;
     HPCON console_ = nullptr;
-    Handle input_, output_;
+    Handle input_, output_, update_;
     bool bundled_;
     std::wstring runtime_;
     VTerm* terminal_ = nullptr;
     VTermScreen* screen_ = nullptr;
-    std::mutex state_mutex_, queue_mutex_;
+    std::mutex state_mutex_, queue_mutex_, console_mutex_;
     std::condition_variable wake_;
     std::deque<std::string> pending_;
     size_t queued_ = 0;
@@ -29,6 +31,9 @@ class Conpty final : public Backend {
     bool resizing_ = false;
     std::thread reader_, writer_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> dirty_{true};
+    std::atomic<bool> output_ended_{false};
+    std::atomic<bool> reader_done_{false}, writer_done_{false};
     std::string failure_;
     bool visible_ = true, alt_ = false;
     int cursor_shape_ = 1;
@@ -56,6 +61,7 @@ class Conpty final : public Backend {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (queued_ + bytes.size() > max_frame) {
             failure_ = "Terminal input queue exceeds 4MiB";
+            SetEvent(update_.get());
             return;
         }
         queued_ += bytes.size();
@@ -256,7 +262,13 @@ class Conpty final : public Backend {
             std::lock_guard<std::mutex> lock(state_mutex_);
             vterm_input_write(terminal_, bytes, length);
             vterm_screen_flush_damage(screen_);
+            dirty_ = true;
+            SetEvent(update_.get());
         }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        output_ended_ = true;
+        dirty_ = true;
+        SetEvent(update_.get());
     }
 
     void write_input() {
@@ -318,9 +330,13 @@ public:
 
     void initialize() override {
         if (bundled_) {
-            auto path = executable_path();
-            path.resize(path.find_last_of(L"\\/"));
-            runtime_ = path + L"\\runtime\\conpty.dll";
+            auto path = options_.runtime_directory;
+            if (path.empty()) {
+                path = executable_path();
+                path.resize(path.find_last_of(L"\\/"));
+                path += L"\\runtime";
+            }
+            runtime_ = path + L"\\conpty.dll";
         } else {
             wchar_t directory[MAX_PATH];
             wincheck(GetSystemDirectoryW(directory, MAX_PATH) != 0, "GetSystemDirectoryW");
@@ -336,6 +352,8 @@ public:
             library_, bundled_ ? "ConptyResizePseudoConsole" : "ResizePseudoConsole"));
         close_ = reinterpret_cast<Close>(
             GetProcAddress(library_, bundled_ ? "ConptyClosePseudoConsole" : "ClosePseudoConsole"));
+        clear_ = reinterpret_cast<Clear>(
+            GetProcAddress(library_, bundled_ ? "ConptyClearPseudoConsole" : "ClearPseudoConsole"));
         if (!create_ || !resize_ || !close_) {
             throw std::runtime_error("ConPTY API unavailable");
         }
@@ -356,6 +374,8 @@ public:
             throw std::runtime_error("ConPTY initialization failed (HRESULT " +
                                      std::to_string(static_cast<unsigned long>(result)) + ')');
         }
+        update_.reset(CreateEventW(nullptr, TRUE, TRUE, nullptr));
+        wincheck(update_.get() != nullptr, "Create terminal update event");
         terminal_ = vterm_new(options_.rows, options_.cols);
         if (!terminal_) {
             throw std::bad_alloc();
@@ -388,9 +408,11 @@ public:
         vterm_screen_reset(screen_, 1);
         reader_ = std::thread([this] {
             read_output();
+            reader_done_ = true;
         });
         writer_ = std::thread([this] {
             write_input();
+            writer_done_ = true;
         });
     }
 
@@ -417,24 +439,18 @@ public:
     }
 
     void command(const Command& value) override {
+        std::lock_guard<std::mutex> console_lock(console_mutex_);
+        if (!console_) {
+            return;
+        }
         if (value.type == 'L') {
-            FreeConsole();
-            wincheck(AttachConsole(pid()), "AttachConsole for screen clear");
-            try {
-                Handle output(CreateFileW(L"CONOUT$",
-                                          GENERIC_READ | GENERIC_WRITE,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                          nullptr,
-                                          OPEN_EXISTING,
-                                          0,
-                                          nullptr));
-                wincheck(output.get() != INVALID_HANDLE_VALUE, "Open console for screen clear");
-                clear_console(output.get());
-            } catch (...) {
-                FreeConsole();
-                throw;
-            }
-            FreeConsole();
+            wincheck(clear_ != nullptr, "Screen clear requires the ConPTY clear API");
+            wincheck(SUCCEEDED(clear_(console_, FALSE)), "Clear pseudoconsole");
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            vterm_state_clear_screen(vterm_obtain_state(terminal_));
+            vterm_screen_flush_damage(screen_);
+            dirty_ = true;
+            SetEvent(update_.get());
             return;
         }
         if (value.type == 'R') {
@@ -444,6 +460,8 @@ public:
                 vterm_set_size(terminal_, value.second, value.first);
                 resizing_ = false;
                 refresh_continuations(0, value.second);
+                dirty_ = true;
+                SetEvent(update_.get());
             }
             const auto result = resize_(
                 console_, {static_cast<SHORT>(value.first), static_cast<SHORT>(value.second)});
@@ -462,6 +480,8 @@ public:
         } else if (value.type == 'H') {
             history_.clear();
             history_cleared_ = true;
+            dirty_ = true;
+            SetEvent(update_.get());
         } else if (value.type == 'K') {
             vterm_keyboard_key(terminal_,
                                static_cast<VTermKey>(value.first),
@@ -480,6 +500,39 @@ public:
         }
     }
 
+    bool supports_clear() const override {
+        return clear_ != nullptr;
+    }
+
+    bool has_updates() override {
+        if (dirty_) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return !failure_.empty();
+    }
+
+    void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr) override {
+        if (!has_updates()) {
+            const HANDLE events[] = {update_.get(), interrupt};
+            wincheck(WaitForMultipleObjects(interrupt ? 2 : 1, events, FALSE, timeout) != WAIT_FAILED,
+                     "Wait for terminal output");
+        }
+    }
+
+    void begin_exit() override {
+        std::lock_guard<std::mutex> console_lock(console_mutex_);
+        Backend::begin_exit();
+        if (console_) {
+            close_(console_);
+            console_ = nullptr;
+        }
+    }
+
+    bool output_finished() override {
+        return output_ended_ && !has_updates();
+    }
+
     Screen snapshot() override {
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -488,6 +541,7 @@ public:
             }
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
+        dirty_ = false;
         Screen result;
         result.history_cleared = std::exchange(history_cleared_, false);
         result.title = title_;
@@ -534,6 +588,10 @@ public:
             result.history_rows.push_back(std::move(history_.front()));
             history_.pop_front();
         }
+        dirty_ = !history_.empty();
+        if (!dirty_) {
+            ResetEvent(update_.get());
+        }
         return result;
     }
 
@@ -544,11 +602,17 @@ public:
         Backend::stop();
         wake_.notify_all();
         if (writer_.joinable()) {
-            CancelSynchronousIo(writer_.native_handle());
+            while (!writer_done_) {
+                CancelSynchronousIo(writer_.native_handle());
+                Sleep(2);
+            }
             writer_.join();
         }
         if (reader_.joinable()) {
-            CancelSynchronousIo(reader_.native_handle());
+            while (!reader_done_) {
+                CancelSynchronousIo(reader_.native_handle());
+                Sleep(2);
+            }
             reader_.join();
         }
         input_.reset();

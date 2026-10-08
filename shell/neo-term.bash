@@ -3,19 +3,28 @@ if [[ $- == *i* && -z ${__neo_term_installed-} ]]; then
     if [[ -f ~/.bashrc ]]; then
         source ~/.bashrc
     fi
-    __neo_term_host=$(cygpath -u "$NEO_TERM_HOST")
-
     neo-open() {
         if [[ $# -lt 1 || $# -gt 3 ]]; then
             printf 'Usage: neo-open FILE [LINE [COLUMN]]\n' >&2
             return 1
         fi
-        "$__neo_term_host" --notify open "$(cygpath -w -- "$1")" "${2:-1}" "${3:-1}"
+        local file
+        file=$(cygpath -aw -- "$1") || return
+        file=${file//\\/\\\\}
+        file=${file//\"/\\\"}
+        __neo_term_notify "$(printf '51;neo-term;{"file":"%s","line":%s,"column":%s}' "$file" "${2:-1}" "${3:-1}")"
+    }
+
+    __neo_term_notify() {
+        local connection
+        exec {connection}>"/dev/tcp/127.0.0.1/$NEO_TERM_PORT" || return
+        printf '%s\n%s' "$NEO_TERM_TOKEN" "$1" >&"$connection"
+        exec {connection}>&-
     }
 
     __neo_term_cwd() {
         local status=$?
-        "$__neo_term_host" --notify cwd
+        __neo_term_notify "cwd;$(cygpath -aw -- "$PWD")"
         return "$status"
     }
 
