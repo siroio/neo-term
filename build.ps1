@@ -97,7 +97,7 @@ try {
             }
         }
 
-        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include @hostSources @objects /Fe:neo-term-host.exe user32.lib
+        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include @hostSources @objects /Fe:neo-term-host.exe user32.lib crypt32.lib
 
         if ($LASTEXITCODE -ne 0) {
             throw 'Host compilation failed.'

@@ -29,6 +29,15 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
     const std::wstring mode = argc > 1 ? argv[1] : L"unicode";
+    if (mode == L"cursor-style") {
+        DWORD output_mode;
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_mode);
+        SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE),
+                       output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        print(L"\x1b[6 qCURSOR_READY");
+        Sleep(INFINITE);
+        return 0;
+    }
     if (mode == L"reflow-cursor") {
         DWORD input_mode;
         GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode);

@@ -40,6 +40,23 @@ int main() {
     vterm_set_utf8(terminal, 1);
     vterm_screen_enable_reflow(screen, true);
     vterm_screen_reset(screen, 1);
+    vterm_screen_mark_prompt(screen, 1);
+    vterm_input_write(terminal, "P> ", 3);
+    vterm_screen_mark_prompt(screen, 2);
+    vterm_input_write(terminal, "XYZ", 3);
+    VTermScreenCell marked{};
+    vterm_screen_get_cell(screen, {0, 0}, &marked);
+    require(marked.prompt == 1, "the prompt start is attached to its actual cell");
+    vterm_set_size(terminal, 2, 8);
+    vterm_screen_get_cell(screen, {0, 2}, &marked);
+    require(marked.prompt == 4, "the input boundary survives reflow and subsequent input");
+    vterm_input_write(terminal, "\rQ", 2);
+    vterm_screen_get_cell(screen, {0, 0}, &marked);
+    require(marked.prompt == 0, "overwriting a prompt start removes its notification");
+    vterm_screen_reset(screen, 1);
+    vterm_screen_get_cell(screen, {0, 3}, &marked);
+    require(marked.prompt == 0, "erasing a prompt removes its notification");
+    vterm_set_size(terminal, 2, 4);
     const char* text = "ABCDEFGHIJKLMNOPQRST";
     vterm_input_write(terminal, text, std::strlen(text));
     require(vterm_state_get_lineinfo(vterm_obtain_state(terminal), 0)->continuation,

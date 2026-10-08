@@ -1,12 +1,14 @@
 ;;; neo-term.el --- Windows native terminal for Emacs -*- lexical-binding: t; -*-
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
 (require 'svg)
+(require 'url-util)
+(require 'thingatpt)
 
 (defgroup neo-term nil "Windows native terminals."
   :group 'processes)
@@ -31,7 +33,10 @@
 (defcustom neo-term-scrollback-lines 2000 "Maximum retained history lines."
   :type 'natnum)
 (defcustom neo-term-shell-integration t
-  "Track directories and prompts for ordinary PowerShell sessions."
+  "Install session-local integration for PowerShell, cmd.exe and Git Bash."
+  :type 'boolean)
+(defcustom neo-term-enable-file-requests t
+  "Allow the shell's neo-open command to open local files in Emacs."
   :type 'boolean)
 (defcustom neo-term-copy-exclude-prompt t
   "Exclude a tracked prompt when copying the current line."
@@ -71,6 +76,11 @@
 (defvar-local neo-term--cols 0)
 (defvar-local neo-term--height 0)
 (defvar-local neo-term--cursor '(0 . 0))
+(defvar-local neo-term--cursor-shape 1)
+(defvar-local neo-term--cursor-blink t)
+(defvar-local neo-term--cursor-phase t)
+(defvar-local neo-term--cursor-timer nil)
+(defvar-local neo-term--exact-prompts nil)
 (defvar-local neo-term--visible t)
 (defvar-local neo-term--alt nil)
 (defvar-local neo-term--copy nil)
@@ -176,7 +186,7 @@
   (let ((width 0))
     (cl-loop for cell across cells do
              (unless (and (vectorp cell)
-                          (= (length cell) 5)
+                          (memq (length cell) '(5 6))
                           (stringp (aref cell 0))
                           (<= 1 (length (aref cell 0)) 16)
                           (memq (aref cell 1) '(1 2))
@@ -184,7 +194,9 @@
                                    (and (integerp (aref cell index))
                                         (<= -1 (aref cell index) #xffffff)))
                           (integerp (aref cell 4))
-                          (<= 0 (aref cell 4) 31))
+                          (<= 0 (aref cell 4) 31)
+                          (or (= (length cell) 5)
+                              (and (integerp (aref cell 5)) (<= 0 (aref cell 5) 7))))
                (error "Invalid terminal cell"))
              (cl-incf width (aref cell 1)))
     (unless (if partial (<= width cols) (= width cols))
@@ -230,6 +242,15 @@
           neo-term--cursor (cons x y)
           neo-term--visible (alist-get 'visible event)
           neo-term--alt (alist-get 'alt event))
+    (let ((shape (or (alist-get 'cursor_shape event) 1)))
+      (unless (memq shape '(1 2 3)) (error "Invalid terminal cursor shape"))
+      (setq neo-term--cursor-shape shape
+            neo-term--cursor-blink (if (assq 'cursor_blink event)
+                                       (alist-get 'cursor_blink event) t)))
+    (cl-loop for notification across (or (alist-get 'shell_events event) [])
+             do (condition-case error
+                    (neo-term--shell-event notification)
+                  (error (message "neo-term: %s" (error-message-string error)))))
     (setq neo-term--mouse (or (alist-get 'mouse event) 0))
     (unless (memq neo-term--mouse '(0 1 2 3))
       (error "Invalid terminal mouse mode"))
@@ -357,7 +378,7 @@
     (when (> neo-term--height 0)
       (set-marker neo-term--screen-start (aref neo-term--row-markers 0)))
     (goto-char (neo-term--cursor-position))
-    (setq cursor-type (if neo-term--visible 'box nil))
+    (neo-term--apply-cursor)
     (dolist (window (get-buffer-window-list (current-buffer) nil t))
       (set-window-start window neo-term--screen-start t)
       (set-window-point window (point)))
@@ -476,33 +497,59 @@
         (setq longest prefix)))))
 
 (defun neo-term--mark-logical-prompts ()
-  (when neo-term--prompt-prefixes
-    (save-excursion
-      (goto-char (point-min))
-      (while (< (point) (point-max))
-        (let* ((bounds (neo-term--logical-bounds))
-               (begin (car bounds)) (end (cdr bounds))
-               (text (let ((neo-term-copy-remove-soft-newlines t))
-                       (neo-term--copy-text begin end))))
-          (remove-text-properties begin (min (point-max) (1+ end))
-                                  '(neo-term-prompt nil neo-term-prompt-end nil))
-          (let ((prefix (neo-term--matching-prompt text)))
-            (when prefix
-              (let ((remaining (length prefix)) (position begin))
-                (while (and (> remaining 0) (< position end))
-                  (unless (or (get-text-property position 'neo-term-soft-wrap)
-                              (get-text-property position 'neo-term-soft-padding))
-                    (cl-decf remaining))
-                  (cl-incf position))
-                (while (and (< position end)
-                            (or (get-text-property position 'neo-term-soft-wrap)
-                                (get-text-property position 'neo-term-soft-padding)))
-                  (cl-incf position))
-                (put-text-property begin position 'neo-term-prompt t)
-                (when (< position (point-max))
-                  (put-text-property position (1+ position) 'neo-term-prompt-end t)))))
-          (goto-char end)
-          (forward-line 1))))))
+  (if neo-term--exact-prompts
+      (neo-term--mark-notified-prompts)
+    (when neo-term--prompt-prefixes
+      (save-excursion
+        (goto-char (point-min))
+        (while (< (point) (point-max))
+          (let* ((bounds (neo-term--logical-bounds))
+                 (begin (car bounds)) (end (cdr bounds))
+                 (text (let ((neo-term-copy-remove-soft-newlines t))
+                         (neo-term--copy-text begin end))))
+            (remove-text-properties begin (min (point-max) (1+ end))
+                                    '(neo-term-prompt nil neo-term-prompt-end nil))
+            (let ((prefix (neo-term--matching-prompt text)))
+              (when prefix
+                (let ((remaining (length prefix)) (position begin))
+                  (while (and (> remaining 0) (< position end))
+                    (unless (or (get-text-property position 'neo-term-soft-wrap)
+                                (get-text-property position 'neo-term-soft-padding))
+                      (cl-decf remaining))
+                    (cl-incf position))
+                  (while (and (< position end)
+                              (or (get-text-property position 'neo-term-soft-wrap)
+                                  (get-text-property position 'neo-term-soft-padding)))
+                    (cl-incf position))
+                  (put-text-property begin position 'neo-term-prompt t)
+                  (when (< position (point-max))
+                    (put-text-property position (1+ position) 'neo-term-prompt-end t)))))
+            (goto-char end)
+            (forward-line 1)))))))
+
+(defun neo-term--mark-notified-prompts ()
+  (remove-text-properties (point-min) (point-max)
+                          '(neo-term-prompt nil neo-term-prompt-end nil))
+  (let ((position (point-min)) start)
+    (while (< position (point-max))
+      (let ((role (get-text-property position 'neo-term-prompt-role)))
+        (when role
+          (when (/= 0 (logand role 1)) (setq start position))
+          (when (and start (/= 0 (logand role 6)))
+            (let ((input (if (/= 0 (logand role 4))
+                             (next-single-property-change position 'neo-term-prompt-role
+                                                          nil (point-max))
+                           position)))
+              (while (and (< input (point-max))
+                          (or (get-text-property input 'neo-term-soft-wrap)
+                              (get-text-property input 'neo-term-soft-padding)))
+                (cl-incf input))
+              (put-text-property start input 'neo-term-prompt t)
+              (when (< input (point-max))
+                (put-text-property input (1+ input) 'neo-term-prompt-end t)))
+            (setq start nil))))
+      (setq position (next-single-property-change position 'neo-term-prompt-role
+                                                  nil (point-max))))))
 
 (defun neo-term--mark-prompt (begin end)
   (let ((text (buffer-substring-no-properties begin end)))
@@ -514,29 +561,37 @@
   (when (and (stringp raw-title) (<= (length raw-title) 16384)
              (not (equal raw-title neo-term--raw-title)))
     (setq neo-term--raw-title raw-title)
-    (if (string-prefix-p "neo-term;" raw-title)
-        (condition-case nil
-            (let* ((json (decode-coding-string
-                          (base64-decode-string (substring raw-title 9)) 'utf-8 t))
-                   (metadata (json-parse-string json :object-type 'alist))
-                   (directory (alist-get 'directory metadata))
-                   (prompt (alist-get 'prompt metadata))
-                   (title (alist-get 'title metadata)))
-              (when (and (stringp directory)
-                         (string-match-p "\\`[A-Za-z]:[/\\\\]" directory)
-                         (file-directory-p directory))
-                (setq default-directory (file-name-as-directory directory)))
-              (when (and (stringp prompt) (< 0 (length prompt) 1024)
-                         (not (string-match-p "[\r\n]" prompt))
-                         (not (member prompt neo-term--prompt-prefixes)))
-                (push prompt neo-term--prompt-prefixes)
-                (setq neo-term--prompt-prefixes
-                      (cl-subseq neo-term--prompt-prefixes
-                                 0 (min 64 (length neo-term--prompt-prefixes)))
-                      neo-term--render-layout nil))
-              (when (stringp title) (neo-term--set-title title)))
-          (error nil))
-      (neo-term--set-title raw-title))))
+    (cond
+     ((string-prefix-p "neo-term-cmd;" raw-title)
+      (let ((directory (substring raw-title 13)))
+        (when (file-directory-p directory)
+          (setq default-directory (file-name-as-directory directory)))))
+     ((string-prefix-p "neo-term;" raw-title)
+      (condition-case nil
+          (neo-term--update-metadata
+           (json-parse-string
+            (decode-coding-string (base64-decode-string (substring raw-title 9)) 'utf-8 t)
+            :object-type 'alist))
+        (error nil)))
+     (t (neo-term--set-title raw-title)))))
+
+(defun neo-term--update-metadata (metadata)
+  (let ((directory (alist-get 'directory metadata))
+        (prompt (alist-get 'prompt metadata))
+        (title (alist-get 'title metadata)))
+    (when (and (stringp directory)
+               (string-match-p "\\`[A-Za-z]:[/\\\\]" directory)
+               (file-directory-p directory))
+      (setq default-directory (file-name-as-directory directory)))
+    (when (and (stringp prompt) (< 0 (length prompt) 1024)
+               (not (string-match-p "[\r\n]" prompt))
+               (not (member prompt neo-term--prompt-prefixes)))
+      (push prompt neo-term--prompt-prefixes)
+      (setq neo-term--prompt-prefixes
+            (cl-subseq neo-term--prompt-prefixes
+                       0 (min 64 (length neo-term--prompt-prefixes)))
+            neo-term--render-layout nil))
+    (when (stringp title) (neo-term--set-title title))))
 
 (defun neo-term--set-title (title)
   (let ((clean (replace-regexp-in-string "[[:cntrl:]]" "" title)))
@@ -632,7 +687,109 @@
              do (set-char-table-range char-width-table (aref text index) 0))
     (let* ((face (neo-term--cell-face cell))
            (display (neo-term--cell-display text width face)))
-      (insert (propertize text 'face face 'display display)))))
+      (let ((role (and (= (length cell) 6) (> (aref cell 5) 0) (aref cell 5))))
+        (when role (setq neo-term--exact-prompts t))
+        (insert (propertize text 'face face 'display display
+                            'neo-term-prompt-role role))))))
+
+(defun neo-term--apply-cursor ()
+  (setq cursor-type
+        (cond (neo-term--copy 'bar)
+              ((or (not neo-term--visible)
+                   (and neo-term--cursor-blink (not neo-term--cursor-phase))) nil)
+              (t (nth (1- neo-term--cursor-shape) '(box hbar bar))))))
+
+(defun neo-term--blink-cursor (buffer)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (eq buffer (window-buffer (selected-window)))
+                 (not neo-term--copy) neo-term--visible neo-term--cursor-blink)
+        (setq neo-term--cursor-phase (not neo-term--cursor-phase))
+        (neo-term--apply-cursor)))))
+
+(defun neo-term--reset-cursor ()
+  (setq neo-term--cursor-phase t)
+  (neo-term--apply-cursor))
+
+(defun neo-term--parse-file-reference (text)
+  (let ((path (string-trim text)) (line 1) (column 1))
+    (when (and (> (length path) 1) (memq (aref path 0) '(?\" ?\'))
+               (= (aref path 0) (aref path (1- (length path)))))
+      (setq path (substring path 1 -1)))
+    (when (string-match ":\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?\\'" path)
+      (setq line (max 1 (string-to-number (match-string 1 path)))
+            column (if (match-string 2 path)
+                       (max 1 (string-to-number (match-string 2 path))) 1)
+            path (substring path 0 (match-beginning 0))))
+    (when (and (> (length path) 1)
+               (memq (aref path 0) '(?\" ?\'))
+               (= (aref path 0) (aref path (1- (length path)))))
+      (setq path (substring path 1 -1)))
+    (list path line column)))
+
+(defun neo-term--resolve-file (path)
+  (unless (and (stringp path) (> (length path) 0)
+               (not (string-match-p "[\0\r\n]" path))
+               (not (file-remote-p path)))
+    (user-error "Only local file paths are supported"))
+  (when (string-match "\\`/\\([a-zA-Z]\\)/" path)
+    (setq path (concat (match-string 1 path) ":/" (substring path 3))))
+  (expand-file-name path default-directory))
+
+(defun neo-term--visit-file (path line column)
+  (let ((file (neo-term--resolve-file path)))
+    (unless (and (integerp line) (<= 1 line 10000000)
+                 (integerp column) (<= 1 column 10000000))
+      (user-error "Invalid file line or column"))
+    (unless (file-exists-p file) (user-error "File does not exist: %s" file))
+    (find-file-other-window file)
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (move-to-column (1- column))))
+
+(defun neo-term-open-file (&optional reference)
+  "Open a local path at point or the selected region, with optional :LINE:COLUMN."
+  (interactive)
+  (let* ((text (or reference
+                   (and (use-region-p)
+                        (buffer-substring-no-properties (region-beginning) (region-end)))
+                   (thing-at-point 'filename t)
+                   (read-file-name "Open file: ")))
+         (location (neo-term--parse-file-reference text)))
+    (apply #'neo-term--visit-file location)))
+
+(defun neo-term--shell-event (notification)
+  (unless (and (stringp notification) (<= (length notification) 16384))
+    (error "Invalid shell notification"))
+  (cond
+   ((string-prefix-p "cwd;" notification)
+    (let ((directory (neo-term--resolve-file (substring notification 4))))
+      (when (file-directory-p directory)
+        (setq default-directory (file-name-as-directory directory)))))
+   ((string-prefix-p "meta;" notification)
+    (neo-term--update-metadata
+     (json-parse-string (substring notification 5) :object-type 'alist)))
+   ((string-prefix-p "7;file://" notification)
+    (when (string-match "\\`7;file://\\(?:localhost\\)?/\\(.*\\)\\'" notification)
+      (let ((directory (url-unhex-string (match-string 1 notification))))
+        (when (and (string-match-p "\\`[a-zA-Z]:[/\\\\]" directory)
+                   (file-directory-p directory))
+          (setq default-directory (file-name-as-directory directory))))))
+   ((string-prefix-p "51;neo-term;" notification)
+    (when neo-term-enable-file-requests
+      (let* ((data (json-parse-string (substring notification 12) :object-type 'alist))
+             (path (alist-get 'file data))
+             (line (or (alist-get 'line data) 1))
+             (column (or (alist-get 'column data) 1)))
+        (neo-term--resolve-file path)
+        (run-at-time 0 nil #'neo-term--open-request (current-buffer) path line column))))))
+
+(defun neo-term--open-request (buffer path line column)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (condition-case error
+          (neo-term--visit-file path line column)
+        (error (message "neo-term: %s" (error-message-string error)))))))
 
 (defun neo-term--key-command (event)
   (let* ((basic (event-basic-type event))
@@ -858,6 +1015,7 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
     (define-key map (kbd "C-d") #'neo-term-describe-session)
     (define-key map (kbd "C-p") #'neo-term-previous-prompt)
     (define-key map (kbd "C-n") #'neo-term-next-prompt)
+    (define-key map (kbd "C-f") #'neo-term-open-file)
     map))
 
 (defvar neo-term-mode-map
@@ -916,6 +1074,7 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
     map))
 
 (defun neo-term--cleanup ()
+  (when (timerp neo-term--cursor-timer) (cancel-timer neo-term--cursor-timer))
   (when (timerp neo-term--timer)
     (cancel-timer neo-term--timer))
   (when (process-live-p neo-term--process)
@@ -928,6 +1087,10 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
   (setq-local buffer-undo-list t)
   (setq-local scroll-margin 0)
   (setq-local line-spacing 0)
+  (setq-local blink-cursor-alist '((box . box) (bar . bar) (hbar . hbar) (nil . nil)))
+  (unless noninteractive
+    (setq neo-term--cursor-timer
+          (run-at-time .5 .5 #'neo-term--blink-cursor (current-buffer))))
   (setq-local char-width-table (copy-sequence char-width-table))
   (setq neo-term--glyph-cache (make-hash-table
                                :test 'equal))
@@ -938,6 +1101,8 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
   (buffer-face-mode 1)
   (neo-term--restore-display-protection)
   (add-hook 'post-command-hook #'neo-term--restore-display-protection nil t)
+  (add-hook 'post-command-hook #'neo-term--reset-cursor nil t)
+  (add-hook 'change-major-mode-hook #'neo-term--cleanup nil t)
   (add-hook 'kill-buffer-hook #'neo-term--cleanup nil t))
 
 (defun neo-term--size (window)
@@ -957,24 +1122,37 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
 (add-hook 'window-size-change-functions #'neo-term--resize)
 
 (defun neo-term--shell-arguments ()
-  (if (and neo-term-shell-integration
-           (member (downcase (file-name-base neo-term-shell)) '("powershell" "pwsh"))
-           (cl-every (lambda (argument)
-                       (member (downcase argument) '("-nologo" "-noprofile" "-noexit")))
-                     neo-term-shell-arguments))
-      (append neo-term-shell-arguments
-              (unless (member "-noexit" (mapcar #'downcase neo-term-shell-arguments))
-                '("-NoExit"))
-              (list "-EncodedCommand"
-                    (base64-encode-string
-                     (encode-coding-string
-                      (with-temp-buffer
-                        (insert-file-contents (expand-file-name "shell/neo-term.ps1"
-                                                                neo-term--directory))
-                        (buffer-string))
-                      'utf-16le t)
-                     t)))
-    neo-term-shell-arguments))
+  (cond
+   ((and neo-term-shell-integration
+         (member (downcase (file-name-base neo-term-shell)) '("powershell" "pwsh"))
+         (cl-every (lambda (argument)
+                     (member (downcase argument) '("-nologo" "-noprofile" "-noexit")))
+                   neo-term-shell-arguments))
+    (append neo-term-shell-arguments
+            (unless (member "-noexit" (mapcar #'downcase neo-term-shell-arguments))
+              '("-NoExit"))
+            (list "-EncodedCommand"
+                  (base64-encode-string
+                   (encode-coding-string
+                    (with-temp-buffer
+                      (insert-file-contents (expand-file-name "shell/neo-term.ps1"
+                                                              neo-term--directory))
+                      (buffer-string))
+                    'utf-16le t)
+                   t))))
+   ((and neo-term-shell-integration
+         (equal (downcase (file-name-base neo-term-shell)) "cmd")
+         (cl-every (lambda (argument) (member (downcase argument) '("/d" "/q")))
+                   neo-term-shell-arguments))
+    (append neo-term-shell-arguments
+            (list "/D" "/K" (expand-file-name "shell/neo-term.cmd" neo-term--directory))))
+   ((and neo-term-shell-integration
+         (equal (downcase (file-name-base neo-term-shell)) "bash")
+         (cl-every (lambda (argument) (member argument '("-i" "--noprofile" "--norc")))
+                   neo-term-shell-arguments))
+    (list "--noprofile" "--rcfile"
+          (expand-file-name "shell/neo-term.bash" neo-term--directory) "-i"))
+   (t neo-term-shell-arguments)))
 
 (defun neo-term--host-command (size)
   (append
@@ -988,6 +1166,24 @@ INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
    (when neo-term-no-conpty '("--no-conpty"))
    (list "--" neo-term-shell)
    (neo-term--shell-arguments)))
+
+(defun neo-term-cmd ()
+  "Start cmd.exe with session-local shell integration."
+  (interactive)
+  (let ((neo-term-shell "cmd.exe") (neo-term-shell-arguments nil))
+    (neo-term)))
+
+(defun neo-term-git-bash ()
+  "Start the Git installation's Bash with session-local shell integration."
+  (interactive)
+  (let* ((git (executable-find "git.exe"))
+         (execution-path (and git (car (process-lines git "--exec-path"))))
+         (bash (and execution-path (expand-file-name "../../../bin/bash.exe"
+                                                     (file-name-as-directory execution-path)))))
+    (unless (and bash (file-executable-p bash))
+      (user-error "Git Bash was not found beside git.exe"))
+    (let ((neo-term-shell bash) (neo-term-shell-arguments nil))
+      (neo-term))))
 
 (defun neo-term--process-filter (process bytes)
   (when (buffer-live-p (process-buffer process))

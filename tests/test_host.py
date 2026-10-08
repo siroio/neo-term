@@ -34,6 +34,7 @@ class Session:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW,
+            cwd=ROOT,
         )
         self.events = queue.Queue()
         self.rows = {}
@@ -364,6 +365,186 @@ class HostSpecifications(unittest.TestCase):
                     return Path(data["directory"]) == destination
 
                 session.until(changed_directory)
+
+    def test_powershell_reports_exact_prompt_cells(self):
+        startup = "function prompt { 'CUSTOM> ' }; " + (ROOT / "shell" / "neo-term.ps1").read_text(
+            encoding="utf-8"
+        )
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend,
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NoExit",
+                        "-EncodedCommand",
+                        base64.b64encode(startup.encode("utf-16le")).decode("ascii"),
+                    ],
+                )
+                session.until(
+                    lambda e: any(
+                        len(cell) == 6 and cell[5] & 6
+                        for row in session.rows.values()
+                        for cell in row
+                    )
+                )
+                marked = [
+                    cell
+                    for row in session.rows.values()
+                    for cell in row
+                    if len(cell) == 6 and cell[5]
+                ]
+                self.assertTrue(any(cell[0] == "C" and cell[5] & 1 for cell in marked))
+
+    def test_classic_prompt_wrap_at_buffer_bottom_keeps_exact_positions(self):
+        for column, prompt in ((0, "'BOUNDARY_' + ('x' * 90) + '> '"), (39, "'B> '")):
+            with self.subTest(column=column):
+                startup = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
+                startup += f"\n$global:neoTermOriginalPrompt = {{ {prompt} }}; "
+                startup += f"[Console]::SetCursorPosition({column}, [Console]::BufferHeight - 1)"
+                session, _ = self.run_session(
+                    "classic",
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NoExit",
+                        "-EncodedCommand",
+                        base64.b64encode(startup.encode("utf-16le")).decode("ascii"),
+                    ],
+                    extra=("--cols", "40"),
+                )
+                session.until(
+                    lambda e: any(
+                        len(cell) == 6 and cell[0] == "B" and cell[5] & 1
+                        for row in session.rows.values()
+                        for cell in row
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        len(cell) == 6 and cell[5] & 6
+                        for row in session.rows.values()
+                        for cell in row
+                    )
+                )
+
+    def test_shell_file_requests_arrive_on_every_backend(self):
+        startup = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
+        code = (
+            startup
+            + f"\nneo-open '{(ROOT / 'README.md').as_posix()}' 12 3; Start-Sleep -Seconds 30"
+        )
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend,
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-EncodedCommand",
+                        base64.b64encode(code.encode("utf-16le")).decode("ascii"),
+                    ],
+                )
+                event = session.until(
+                    lambda e: any(
+                        text.startswith("51;neo-term;") for text in e.get("shell_events", [])
+                    )
+                )
+                request = next(
+                    text[12:] for text in event["shell_events"] if text.startswith("51;neo-term;")
+                )
+                self.assertEqual(
+                    json.loads(request), {"file": str(ROOT / "README.md"), "line": 12, "column": 3}
+                )
+
+    def test_cmd_integration_reports_directory_and_opens_files(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend, ["cmd.exe", "/D", "/Q", "/K", ROOT / "shell" / "neo-term.cmd"]
+                )
+                session.until(lambda e: ">" in session.text())
+                if backend != "classic" and not any(
+                    cell[5] & 6 for row in session.rows.values() for cell in row
+                ):
+                    session.until(
+                        lambda e: any(cell[5] & 6 for row in session.rows.values() for cell in row)
+                    )
+                session.send("Tcd build")
+                session.send("K1,0")
+                session.until(lambda e: e.get("title", "").endswith("\\build"))
+                session.send("Tneo-open ..\\README.md 2 4")
+                session.send("K1,0")
+                event = session.until(
+                    lambda e: any(
+                        text.startswith("51;neo-term;") for text in e.get("shell_events", [])
+                    )
+                )
+                request = next(
+                    json.loads(text[12:])
+                    for text in event["shell_events"]
+                    if text.startswith("51;neo-term;")
+                )
+                self.assertEqual(Path(request["file"]), ROOT / "README.md")
+                self.assertEqual((request["line"], request["column"]), (2, 4))
+
+    def test_terminal_cursor_style_reaches_the_frontend(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "cursor-style"])
+                event = session.until(lambda e: "CURSOR_READY" in session.text())
+                self.assertEqual(event["cursor_shape"], 3)
+                self.assertFalse(event["cursor_blink"])
+
+    def test_git_bash_integration_reports_directory_and_opens_files(self):
+        git = shutil.which("git.exe")
+        if not git:
+            self.skipTest("Git Bash is required")
+        execution_path = subprocess.check_output([git, "--exec-path"], text=True).strip()
+        bash = Path(execution_path).parents[2] / "bin" / "bash.exe"
+        if not bash.exists():
+            self.skipTest("Git Bash is required")
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend,
+                    [bash, "--noprofile", "--rcfile", ROOT / "shell" / "neo-term.bash", "-i"],
+                )
+                event = session.until(
+                    lambda e: any(text.startswith("cwd;") for text in e.get("shell_events", []))
+                )
+                directory = next(
+                    text[4:] for text in event["shell_events"] if text.startswith("cwd;")
+                )
+                self.assertEqual(Path(directory), ROOT)
+                if backend != "classic" and not any(
+                    cell[5] & 6 for row in session.rows.values() for cell in row
+                ):
+                    session.until(
+                        lambda e: any(cell[5] & 6 for row in session.rows.values() for cell in row)
+                    )
+                session.send("Tcd build")
+                session.send("K1,0")
+                session.until(
+                    lambda e: any(
+                        text.startswith("cwd;") and Path(text[4:]) == ROOT / "build"
+                        for text in e.get("shell_events", [])
+                    )
+                )
+                session.send("Tneo-open ../README.md 4 2")
+                session.send("K1,0")
+                event = session.until(
+                    lambda e: any(
+                        text.startswith("51;neo-term;") for text in e.get("shell_events", [])
+                    )
+                )
+                request = next(
+                    json.loads(text[12:])
+                    for text in event["shell_events"]
+                    if text.startswith("51;neo-term;")
+                )
+                self.assertEqual((request["line"], request["column"]), (4, 2))
 
     def test_powershell_custom_prompt_preserves_failed_status_and_native_exit_code(self):
         script = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")

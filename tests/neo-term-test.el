@@ -7,6 +7,81 @@
                     (vector (char-to-string character) 1 (or color -1) -1 0))
                   (string-to-list text))))
 
+(ert-deftest neo-term-notified-prompts-do-not-match-similar-output ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> "))
+    (neo-term-test-rich-screen
+     8 (vector (vector [["P" 1 -1 -1 0 1] [">" 1 -1 -1 0 0]
+                        [" " 1 -1 -1 0 0] ["x" 1 -1 -1 0 2]] nil)
+               (vector (neo-term-test-cells "P> fake") nil)))
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should (= (line-number-at-pos) 1))
+    (should (= (current-column) 3))
+    (should-error (neo-term-previous-prompt) :type 'user-error)))
+
+(ert-deftest neo-term-notified-prompt-survives-history-reflow ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen
+     4 (vector (vector [["P" 1 -1 -1 0 1] [">" 1 -1 -1 0 0]
+                        [" " 1 -1 -1 0 0] ["X" 1 -1 -1 0 2]
+                        ["Y" 1 -1 -1 0 0]] nil)))
+    (neo-term-test-rich-screen 8 [])
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should (= (current-column) 3))
+    (let ((kill-ring nil))
+      (neo-term-copy-mode-done)
+      (should (equal (current-kill 0) "XY")))))
+
+(ert-deftest neo-term-cursor-shape-and-blink-stay-buffer-local ()
+  (let ((original-blink blink-cursor-mode))
+    (with-temp-buffer
+      (neo-term-mode)
+      (neo-term--screen '((cols . 4) (height . 2) (x . 0) (y . 0) (visible . t)
+                          (cursor_shape . 3) (cursor_blink . nil) (rows . [])))
+      (should (eq cursor-type 'bar))
+      (should-not neo-term--cursor-blink)
+      (neo-term--screen '((cols . 4) (height . 2) (x . 0) (y . 0) (visible . t)
+                          (cursor_shape . 2) (cursor_blink . t) (rows . [])))
+      (should (eq cursor-type 'hbar))
+      (should neo-term--cursor-blink)
+      (neo-term-copy-mode 1)
+      (should (eq cursor-type 'bar)))
+    (should (eq blink-cursor-mode original-blink))))
+
+(ert-deftest neo-term-file-link-preserves-drive-spaces-line-and-column ()
+  (should (equal (neo-term--parse-file-reference "\"C:\\work dir\\日本語.txt\":12:3")
+                 '("C:\\work dir\\日本語.txt" 12 3)))
+  (should (equal (neo-term--parse-file-reference "src/main.cpp:8")
+                 '("src/main.cpp" 8 1)))
+  (should (equal (neo-term--parse-file-reference "\"src/main.cpp:12:3\"")
+                 '("src/main.cpp" 12 3)))
+  (should-error (neo-term--resolve-file "/ssh:host:/tmp/a") :type 'user-error))
+
+(ert-deftest neo-term-file-command-visits-the-requested-line-and-column ()
+  (let ((file (make-temp-file "neo-term 日本語 " nil ".txt" "first\nsecond\nthird"))
+        visiting)
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-buffer
+            (neo-term-mode)
+            (neo-term-open-file (concat "\"" file "\":2:3"))
+            (setq visiting (current-buffer))
+            (should (equal buffer-file-name (expand-file-name file)))
+            (should (= (line-number-at-pos) 2))
+            (should (= (current-column) 2))))
+      (when (buffer-live-p visiting) (kill-buffer visiting))
+      (delete-file file))))
+
+(ert-deftest neo-term-disabled-file-requests-do-not-open-a-buffer ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((neo-term-enable-file-requests nil))
+      (should-not (neo-term--shell-event "51;neo-term;{\"file\":\"missing\"}")))))
+
 (defun neo-term-test-rich-screen (columns history &optional rows continuations)
   (neo-term--screen
    `((v . 1) (cols . ,columns) (height . 2) (x . 0) (y . 0) (visible . t)

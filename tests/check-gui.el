@@ -74,6 +74,36 @@
                 (error "GUI scrollback did not reflow after widening"))
               (redisplay t))
           (kill-buffer buffer)))
+      (let ((buffer (generate-new-buffer "*neo-term-cursor-file-check*"))
+            (file (make-temp-file "neo-term GUI 日本語 " nil ".txt" "first\nsecond\nthird"))
+            visiting)
+        (unwind-protect
+            (progn
+              (pop-to-buffer buffer)
+              (neo-term-mode)
+              (neo-term--screen
+               '((cols . 4) (height . 2) (x . 0) (y . 0) (visible . t)
+                 (cursor_shape . 2) (cursor_blink . nil) (rows . [])))
+              (neo-term--render)
+              (unless (eq cursor-type 'hbar) (error "GUI underline cursor was not applied"))
+              (setq neo-term--cursor-blink t neo-term--cursor-phase t)
+              (neo-term--blink-cursor buffer)
+              (unless (null cursor-type) (error "GUI cursor did not blink off"))
+              (neo-term--reset-cursor)
+              (unless (eq cursor-type 'hbar) (error "GUI cursor did not return"))
+              (neo-term--shell-event
+               (concat "51;neo-term;"
+                       (json-encode (list (cons 'file file) '(line . 2) '(column . 3)))))
+              (neo-term-gui-wait
+               (lambda ()
+                 (with-current-buffer (window-buffer (selected-window))
+                   (and buffer-file-name (equal buffer-file-name (expand-file-name file))
+                        (= (line-number-at-pos) 2) (= (current-column) 2)))))
+              (setq visiting (window-buffer (selected-window)))
+              (redisplay t))
+          (when (buffer-live-p visiting) (kill-buffer visiting))
+          (kill-buffer buffer)
+          (delete-file file)))
       (dolist (backend (append '(system-conpty classic)
                                (when (file-exists-p (expand-file-name
                                                      "build/runtime/conpty.dll"
@@ -204,7 +234,7 @@
             (when (buffer-live-p buffer) (kill-buffer buffer)))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
         (insert
-         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; colored history/reflow/wrapped copy/prompt navigation; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width)\n"))
+         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; colored history/reflow/wrapped copy/prompt navigation; cursor shape/blink and file requests; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

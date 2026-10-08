@@ -529,6 +529,7 @@ typedef struct {
   char     width;
   VTermScreenCellAttrs attrs;
   VTermColor fg, bg;
+  unsigned char prompt;
 } VTermScreenCell;
 
 typedef struct {
@@ -597,6 +598,7 @@ typedef enum {
 int vterm_screen_get_attrs_extent(const VTermScreen *screen, VTermRect *extent, VTermPos pos, VTermAttrMask attrs);
 
 int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCell *cell);
+void vterm_screen_mark_prompt(VTermScreen *screen, unsigned char role);
 
 int vterm_screen_is_eol(const VTermScreen *screen, VTermPos pos);
 

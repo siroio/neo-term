@@ -31,6 +31,10 @@ class Conpty final : public Backend {
     std::atomic<bool> stopping_{false};
     std::string failure_;
     bool visible_ = true, alt_ = false;
+    int cursor_shape_ = 1;
+    bool cursor_blink_ = true;
+    std::string pending_osc_;
+    std::deque<std::string> shell_events_;
     bool history_cleared_ = false;
     std::string title_, pending_title_;
     bool title_overflow_ = false;
@@ -64,6 +68,12 @@ class Conpty final : public Backend {
         if (property == VTERM_PROP_CURSORVISIBLE) {
             self.visible_ = value->boolean != 0;
         }
+        if (property == VTERM_PROP_CURSORSHAPE) {
+            self.cursor_shape_ = value->number;
+        }
+        if (property == VTERM_PROP_CURSORBLINK) {
+            self.cursor_blink_ = value->boolean != 0;
+        }
         if (property == VTERM_PROP_ALTSCREEN) {
             self.alt_ = value->boolean != 0;
         }
@@ -85,6 +95,34 @@ class Conpty final : public Backend {
         }
         if (property == VTERM_PROP_MOUSE) {
             self.mouse_ = value->number;
+        }
+        return 1;
+    }
+
+    static int osc_callback(int command, VTermStringFragment fragment, void* user) {
+        auto& self = *static_cast<Conpty*>(user);
+        if (command != 133 && command != 7 && command != 51) {
+            return 0;
+        }
+        if (fragment.initial) {
+            self.pending_osc_.clear();
+        }
+        if (self.pending_osc_.size() + fragment.len > 16384) {
+            self.pending_osc_.assign(16385, ' ');
+            return 1;
+        }
+        self.pending_osc_.append(fragment.str, fragment.len);
+        if (fragment.final) {
+            if (command == 133) {
+                if (self.pending_osc_ == "A" || self.pending_osc_ == "B") {
+                    vterm_screen_mark_prompt(self.screen_, self.pending_osc_ == "A" ? 1 : 2);
+                }
+            } else {
+                if (self.shell_events_.size() == 32) {
+                    self.shell_events_.pop_front();
+                }
+                self.shell_events_.push_back(std::to_string(command) + ';' + self.pending_osc_);
+            }
         }
         return 1;
     }
@@ -156,6 +194,7 @@ class Conpty final : public Backend {
             cell.text = " ";
         }
         cell.width = source.width > 0 ? source.width : 1;
+        cell.prompt = source.prompt;
         cell.fg = color(source.fg);
         cell.bg = color(source.bg);
         cell.attributes = (source.attrs.bold ? 1 : 0) | (source.attrs.underline ? 2 : 0) |
@@ -186,7 +225,7 @@ class Conpty final : public Backend {
         Screen::HistoryRow line;
         line.continuation = continuation;
         int end = cols;
-        while (end > 0 && cells[end - 1].chars[0] == 0 &&
+        while (end > 0 && cells[end - 1].chars[0] == 0 && cells[end - 1].prompt == 0 &&
                (cells[end - 1].bg.type & VTERM_COLOR_DEFAULT_MASK) &&
                !cells[end - 1].attrs.reverse) {
             --end;
@@ -337,6 +376,9 @@ public:
                                                        clear_callback,
                                                        reflow_pushline_callback};
         vterm_screen_set_callbacks(screen_, &callbacks, this);
+        static const VTermStateFallbacks fallbacks = {
+            nullptr, nullptr, osc_callback, nullptr, nullptr, nullptr, nullptr};
+        vterm_screen_set_unrecognised_fallbacks(screen_, &fallbacks, this);
         static const VTermSelectionCallbacks selection_callbacks = {selection_callback, nullptr};
         vterm_state_set_selection_callbacks(vterm_obtain_state(terminal_),
                                             &selection_callbacks,
@@ -449,6 +491,10 @@ public:
         Screen result;
         result.history_cleared = std::exchange(history_cleared_, false);
         result.title = title_;
+        result.cursor_shape = cursor_shape_;
+        result.cursor_blink = cursor_blink_;
+        result.shell_events.assign(shell_events_.begin(), shell_events_.end());
+        shell_events_.clear();
         result.mouse = mouse_;
         result.clipboard.assign(clipboard_.begin(), clipboard_.end());
         clipboard_.clear();

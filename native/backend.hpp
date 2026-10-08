@@ -113,12 +113,13 @@ struct Cell {
     int fg = -1;
     int bg = -1;
     int attributes = 0;
+    int prompt = 0;
 };
 
 inline std::string cell_json(const Cell& cell) {
     return '[' + json_string(cell.text) + ',' + std::to_string(cell.width) + ',' +
            std::to_string(cell.fg) + ',' + std::to_string(cell.bg) + ',' +
-           std::to_string(cell.attributes) + ']';
+           std::to_string(cell.attributes) + ',' + std::to_string(cell.prompt) + ']';
 }
 
 struct Screen {
@@ -127,11 +128,14 @@ struct Screen {
     int x = 0;
     int y = 0;
     bool visible = true;
+    int cursor_shape = 1;
+    bool cursor_blink = true;
     bool alt = false;
     bool history_cleared = false;
     std::string title;
     int mouse = 0;
     std::vector<std::string> clipboard;
+    std::vector<std::string> shell_events;
     std::vector<std::vector<Cell>> lines;
     std::vector<std::string> history;
 
@@ -196,6 +200,9 @@ public:
     virtual void launch() = 0;
     virtual Screen snapshot() = 0;
     virtual void command(const Command& command) = 0;
+
+    virtual void shell_notification(const std::string&) {
+    }
 
     virtual void stop() {
         if (job_.get()) {

@@ -48,3 +48,11 @@ History/reflow RED/GREEN: カラー・wide/combiningセル・履歴/画面境界
 History/reflow review: 独立レビューでclassicのrows2履歴追跡、境界カーソルによる実改行の誤結合を修正。実WinConsoleカーソル座標によって標準ConPTY側の反復リサイズ不具合を切り分け、アプリのカーソル管理と競合する強制補正は採用しない。
 History/reflow limits: classicは折り返し情報を返さず、元の各行を別論理行として扱う。ConPTYが転送済みSPACEへ変換した空きセルは識別できず保持する。同梱版の末尾入力保持を検証し、標準版の既知の入力上書きをREADMEへ記録。
 History/reflow verification: native/libvterm PASS、CLI26/26（実機Vim含む）、ERT40/40、警告なしbytecompile、3バックエンドGUI PASS。クリア検証は入力全体の表示を待って競合を解消。描画200回/履歴2000行でcursor 0.049秒、1変更行0.235秒。clang-format/Black/git diff --check通過。
+
+Shell notifications: v0.4.0。OSC 133とセル内の開始・入力位置によって通常出力とのプロンプト誤認を防ぎ、履歴・reflow後も位置を保持する。classicのPowerShellはコンソール座標と実表示の確認を使う。
+Shell notifications: バッファごとのカーソル形状・点滅、cmd.exe・Git Bashの自動連携、ローカル名前付きパイプ、neo-openとC-c C-fによるファイル・行・列への移動を追加。PowerShellの実行結果・元prompt、BashのPS1・PROMPT_COMMANDを保持する。
+Shell notifications review: classicのリサイズ・固定バッファスクロールでの位置移動、wide/surrogateセル参照、引用符付きパス、空白セルの入力境界消失を修正。PowerShell 5.1のネイティブ引数引用によるJSON破損は、Windows Crypt32によるBase64通知で解消。
+Shell notifications limits: classicの正確な位置通知はPowerShellのみ。cmd.exe・Git Bashはcwdとファイル要求に対応。classicのカーソルはサイズとWindowsの点滅設定から推定し、個別のVT形状・点滅は取得できない。
+Shell notifications verification: build.ps1 -Testとtest.ps1 -Gui → native/libvterm PASS、CLI31/31（3バックエンド・Git Bash・実機Vim含む）、ERT46/46、警告なしbytecompile、GUIカーソル・ファイル表示 PASS。描画200回/履歴2000行でcursor 0.051秒、1変更行0.231秒。
+Shell notifications final review: classic最下行の長いpromptで描画中スクロールにより開始座標が移動することを追加実機テストで再現。下端を超える通知のみ、明示座標から有限範囲の移動候補を完全表示・終了カーソルで照合して修正。追加テストRED→GREEN。
+Shell notifications final verification: CLI32/32、ERT46/46、native/libvterm・bytecompile・GUI PASS。探索上限へ開始列を加えた最終ビルドでも、プロンプト境界・位置通知・クリア・classicリサイズの追加回帰4件 PASS。clang-format・Black・git diff --check通過。ローカルGitのauthor/committerをsiroioへ設定。

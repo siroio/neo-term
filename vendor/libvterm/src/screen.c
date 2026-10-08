@@ -39,6 +39,8 @@ typedef struct
 {
   uint32_t chars[VTERM_MAX_CHARS_PER_CELL];
   ScreenPen pen;
+  unsigned char prompt;
+  unsigned char prompt_pending;
 } ScreenCell;
 
 struct VTermScreen
@@ -77,6 +79,8 @@ static inline void clearcell(const VTermScreen *screen, ScreenCell *cell)
 {
   cell->chars[0] = 0;
   cell->pen = screen->pen;
+  cell->prompt = 0;
+  cell->prompt_pending = 0;
 }
 
 static inline ScreenCell *getcell(const VTermScreen *screen, int row, int col)
@@ -177,6 +181,11 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
 
   if(!cell)
     return 0;
+
+  if((cell->prompt & 1) && !cell->prompt_pending && cell->chars[0] &&
+      cell->chars[0] != info->chars[0])
+    cell->prompt = 0;
+  cell->prompt_pending = 0;
 
   int i;
   for(i = 0; i < VTERM_MAX_CHARS_PER_CELL && info->chars[i]; i++) {
@@ -281,6 +290,8 @@ static int erase_internal(VTermRect rect, int selective, void *user)
         continue;
 
       cell->chars[0] = 0;
+      cell->prompt = 0;
+      cell->prompt_pending = 0;
       cell->pen = (ScreenPen){
         /* Only copy .fg and .bg; leave things like rv in reset state */
         .fg = screen->pen.fg,
@@ -497,7 +508,8 @@ static int bell(void *user)
 static int line_popcount(ScreenCell *buffer, int row, int rows, int cols)
 {
   int col = cols - 1;
-  while(col >= 0 && buffer[row * cols + col].chars[0] == 0)
+  while(col >= 0 && buffer[row * cols + col].chars[0] == 0 &&
+        buffer[row * cols + col].prompt == 0)
     col--;
   return col + 1;
 }
@@ -1096,6 +1108,8 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
   if(!intcell)
     return 0;
 
+  cell->prompt = intcell->prompt;
+
   for(int i = 0; i < VTERM_MAX_CHARS_PER_CELL; i++) {
     cell->chars[i] = intcell->chars[i];
     if(!intcell->chars[i])
@@ -1126,6 +1140,23 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
     cell->width = 1;
 
   return 1;
+}
+
+void vterm_screen_mark_prompt(VTermScreen *screen, unsigned char role)
+{
+  VTermPos pos = screen->state->pos;
+  if(role == 2 && !screen->state->at_phantom && pos.col > 0) {
+    pos.col--;
+    while(pos.col > 0 && getcell(screen, pos.row, pos.col)->chars[0] == (uint32_t)-1)
+      pos.col--;
+    role = 4;
+  }
+  ScreenCell *cell = getcell(screen, pos.row, pos.col);
+  if(!cell || (role != 1 && role != 2 && role != 4))
+    return;
+  cell->prompt |= role == 2 && screen->state->at_phantom ? 4 : role;
+  cell->prompt_pending = 1;
+  damagerect(screen, (VTermRect){pos.row, pos.row + 1, pos.col, pos.col + 1});
 }
 
 int vterm_screen_is_eol(const VTermScreen *screen, VTermPos pos)

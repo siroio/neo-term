@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "shell.hpp"
 #include <iostream>
 #include <chrono>
 
@@ -78,6 +79,8 @@ public:
         const auto cursor = "\"x\":" + std::to_string(screen.x) +
                             ",\"y\":" + std::to_string(screen.y) +
                             ",\"visible\":" + (screen.visible ? "true" : "false") +
+                            ",\"cursor_shape\":" + std::to_string(screen.cursor_shape) +
+                            ",\"cursor_blink\":" + (screen.cursor_blink ? "true" : "false") +
                             ",\"alt\":" + (screen.alt ? "true" : "false") +
                             ",\"mouse\":" + std::to_string(screen.mouse) +
                             ",\"title\":" + json_string(screen.title);
@@ -100,7 +103,7 @@ public:
         const auto state = cursor + ",\"continuations\":" + continuations +
                            ",\"content_widths\":" + content_widths;
         if (!changed && state == cursor_ && screen.history.empty() && screen.history_rows.empty() &&
-            !screen.history_cleared && screen.clipboard.empty()) {
+            !screen.history_cleared && screen.clipboard.empty() && screen.shell_events.empty()) {
             return {};
         }
         cursor_ = state;
@@ -137,18 +140,29 @@ public:
             clipboard += json_string(text);
         }
         clipboard += ']';
+        std::string shell_events = "[";
+        for (const auto& event : screen.shell_events) {
+            if (shell_events.size() > 1) {
+                shell_events += ',';
+            }
+            shell_events += json_string(event);
+        }
+        shell_events += ']';
         return "{\"type\":\"screen\",\"v\":1,\"generation\":" + std::to_string(++generation_) +
                ",\"cols\":" + std::to_string(screen.cols) +
                ",\"height\":" + std::to_string(screen.rows) + ',' + state + ",\"rows\":" + rows +
                ",\"history\":" + history + ",\"history_rows\":" + history_rows +
                ",\"history_cleared\":" + (screen.history_cleared ? "true" : "false") +
-               ",\"clipboard\":" + clipboard + '}';
+               ",\"clipboard\":" + clipboard + ",\"shell_events\":" + shell_events + '}';
     }
 };
 }
 
 int wmain(int argc, wchar_t** argv) {
     using namespace neo;
+    if (argc >= 2 && std::wstring(argv[1]) == L"--notify") {
+        return shell_helper(argc, argv);
+    }
     const auto input = GetStdHandle(STD_INPUT_HANDLE);
     const auto output = GetStdHandle(STD_OUTPUT_HANDLE);
     Handle main_thread(OpenThread(THREAD_TERMINATE, FALSE, GetCurrentThreadId()));
@@ -205,6 +219,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!backend) {
             throw std::runtime_error("No backend could initialize: " + attempts + ']');
         }
+        ShellBridge shell;
         backend->launch();
         send_frame(
             output,
@@ -243,7 +258,15 @@ int wmain(int argc, wchar_t** argv) {
         int final_samples = 0;
         bool finished = false;
         while (!stopping) {
-            const auto frame = encoder.encode(backend->snapshot());
+            const auto notification = shell.poll();
+            if (!notification.empty()) {
+                backend->shell_notification(notification);
+            }
+            auto screen = backend->snapshot();
+            if (!notification.empty() && notification.rfind("prompt;", 0) != 0) {
+                screen.shell_events.push_back(notification);
+            }
+            const auto frame = encoder.encode(screen);
             if (!frame.empty()) {
                 send_frame(output, frame);
             }
