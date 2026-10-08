@@ -203,8 +203,9 @@ class HostSpecifications(unittest.TestCase):
                     )
                     session.send("K1,0")
                     session.until(lambda e: "CLEAR_SHELL_OK" in session.text())
-                    session.send("Techo PENDING^_" if program[0] == "cmd.exe" else "T'PENDING_' + ")
-                    session.until(lambda e: "PENDING" in session.text())
+                    pending_input = "echo PENDING^_" if program[0] == "cmd.exe" else "'PENDING_' + "
+                    session.send("T" + pending_input)
+                    session.until(lambda e: pending_input in session.text())
                     session.send("L")
                     session.until(lambda e: e["type"] == "screen" and not session.text().strip())
                     session.send("TSHELL_OK" if program[0] == "cmd.exe" else "T'SHELL_OK'")
@@ -229,6 +230,106 @@ class HostSpecifications(unittest.TestCase):
                 self.assertEqual(session.history, [])
                 session.send("Tz")
                 session.until(lambda e: "CHAR=122" in session.text())
+
+    def test_scrollback_retains_color_and_distinguishes_wraps_from_line_breaks(self):
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend,
+                    [FIXTURE, "rich-history"],
+                    ("--cols", "40" if backend == "classic" else "10", "--rows", "4"),
+                )
+                session.until(lambda e: "RICH_READY" in session.text())
+                rows = [row for frame in session.frames for row in frame.get("history_rows", [])]
+                self.assertTrue(rows, "history must carry colored cells")
+                colored = [row for row in rows if any("A" == cell[0] for cell in row[0])]
+                self.assertTrue(colored, "the first colored row must survive scrolling")
+                self.assertNotEqual(colored[0][0][0][2], -1)
+                if backend != "classic":
+                    self.assertTrue(any(row[1] for row in rows), "soft wraps must be tracked")
+                    self.assertTrue(any(not row[1] for row in rows), "hard breaks must remain")
+                session.send("R60,4")
+                session.until(lambda e: e.get("cols") == 60)
+                session.send("R40,6")
+                session.until(lambda e: e.get("cols") == 40 and e.get("height") == 6)
+
+    def test_resizing_live_wrapped_text_preserves_characters_and_cursor(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend, [FIXTURE, "reflow"], ("--cols", "10", "--rows", "6")
+                )
+                session.until(lambda e: "ABCDEFGHIJ" in session.text() and "KLMN" in session.text())
+                self.assertTrue(session.screen["continuations"][1])
+                session.send("R20,6")
+                session.until(lambda e: e.get("cols") == 20 and "ABCDEFGHIJKLMN" in session.text())
+                self.assertEqual(session.screen["y"], 0)
+                session.send("R8,6")
+                session.until(lambda e: e.get("cols") == 8 and "IJKLMN" in session.text())
+                self.assertEqual(
+                    "".join(line.rstrip() for line in session.text().splitlines()), "ABCDEFGHIJKLMN"
+                )
+                self.assertTrue(session.screen["continuations"][1])
+
+    def test_resize_preserves_wrap_between_scrollback_and_live_screen(self):
+        script = "[Console]::Write('ABCDEFGHIJKLMNOPQRST'); Start-Sleep -Seconds 30"
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend,
+                    ["powershell.exe", "-NoProfile", "-Command", script],
+                    ("--cols", "4", "--rows", "2"),
+                )
+                session.until(lambda e: "MNOP" in session.text() and "QRST" in session.text())
+                self.assertTrue(session.screen["continuations"][0])
+                session.send("R8,2")
+                session.until(lambda e: e.get("cols") == 8 and "MNOPQRST" in session.text())
+                self.assertTrue(
+                    session.screen["continuations"][0],
+                    "screen must still continue its preceding history row",
+                )
+
+    def test_small_window_keeps_wrapped_text_in_history_and_live_screen(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(
+                    backend, [FIXTURE, "reflow"], ("--cols", "10", "--rows", "6")
+                )
+                session.until(lambda e: "KLMN" in session.text())
+                session.send("R2,2")
+                session.until(lambda e: e.get("cols") == 2 and "MN" in session.text())
+                self.assertEqual(
+                    "".join(session.history)
+                    + "".join(line.rstrip() for line in session.text().splitlines()),
+                    "ABCDEFGHIJKLMN",
+                )
+
+    def test_input_after_repeated_resize_does_not_overwrite_the_last_character(self):
+        if "bundled-conpty" not in BACKENDS:
+            self.skipTest("bundled ConPTY is required for pending-wrap cursor reflow")
+        session, _ = self.run_session(
+            "bundled-conpty", [FIXTURE, "reflow-cursor"], ("--cols", "4", "--rows", "6")
+        )
+        session.until(lambda e: "A日B" in session.text())
+        for width in (2, 3, 4, 7):
+            session.send(f"R{width},6")
+            session.until(lambda e: e.get("cols") == width)
+        session.send("TZ")
+        session.until(lambda e: "BZ" in session.text())
+        self.assertIn("A日BZ", session.text())
+
+    def test_classic_resize_does_not_collect_existing_history_twice(self):
+        session, _ = self.run_session(
+            "classic", [FIXTURE, "history"], ("--cols", "40", "--rows", "4")
+        )
+        session.until(lambda e: "FIXTURE_READY" in session.text())
+        previous = session.history.copy()
+        session.send("R60,4")
+        session.until(lambda e: e.get("cols") == 60)
+        session.send("Ty")
+        session.until(lambda e: "CHAR=121" in session.text())
+        self.assertEqual(session.history[: len(previous)], previous)
+        self.assertLessEqual(sum(line.strip() == "history 0" for line in session.history), 1)
 
     def test_powershell_prompt_reports_directory_and_keeps_custom_prompt(self):
         script = ROOT / "shell" / "neo-term.ps1"

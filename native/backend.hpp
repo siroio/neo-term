@@ -134,6 +134,15 @@ struct Screen {
     std::vector<std::string> clipboard;
     std::vector<std::vector<Cell>> lines;
     std::vector<std::string> history;
+
+    struct HistoryRow {
+        std::vector<Cell> cells;
+        bool continuation = false;
+    };
+
+    std::vector<HistoryRow> history_rows;
+    std::vector<bool> continuations;
+    std::vector<int> content_widths;
 };
 
 class Backend {

@@ -42,3 +42,9 @@ vterm parity review: 独立レビューの3件（screen-start移動、ドラッ�
 vterm parity performance: 同一条件の200更新、履歴2000行/80列24行。カーソルのみ5.152→0.030秒、1変更行5.484→0.211秒。vtermとの直接比較ではない。
 vterm parity limits: 標準ConPTYでマウスモードが転送されない場合があり、このPCでは同梱版で確認。classicマウス、カラー履歴、折り返し行の結合、UNC/WSL/TRAMP追跡は未対応としてREADMEへ記録。
 vterm parity verification: native PASS、CLI20/20（実機Vimを含む）、ERT28/28、警告なしbytecompile、3バックエンドGUI・同梱版マウス PASS。PowerShellテストのstderrはバイトで収集して混在する文字コードによる検証スレッドの例外を解消。書式チェック通過。
+
+History/reflow: v0.3.0。セル属性付き履歴、soft wrap追跡と論理行コピー、履歴・主画面の幅変更、前後プロンプトへの移動を実装。C-c C-p/C-n、コピーのC-a、RET/M-wを追加・更新。
+History/reflow RED/GREEN: カラー・wide/combiningセル・履歴/画面境界・マーカー・プロンプト消去/折り返しを再現。libvtermの先頭継続行、セル分割、リサイズ後の入力上書き、狭い画面での履歴欠落を再配置処理で修正。
+History/reflow review: 独立レビューでclassicのrows2履歴追跡、境界カーソルによる実改行の誤結合を修正。実WinConsoleカーソル座標によって標準ConPTY側の反復リサイズ不具合を切り分け、アプリのカーソル管理と競合する強制補正は採用しない。
+History/reflow limits: classicは折り返し情報を返さず、元の各行を別論理行として扱う。ConPTYが転送済みSPACEへ変換した空きセルは識別できず保持する。同梱版の末尾入力保持を検証し、標準版の既知の入力上書きをREADMEへ記録。
+History/reflow verification: native/libvterm PASS、CLI26/26（実機Vim含む）、ERT40/40、警告なしbytecompile、3バックエンドGUI PASS。クリア検証は入力全体の表示を待って競合を解消。描画200回/履歴2000行でcursor 0.049秒、1変更行0.235秒。clang-format/Black/git diff --check通過。

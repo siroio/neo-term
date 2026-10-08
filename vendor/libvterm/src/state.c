@@ -2035,10 +2035,12 @@ static int on_resize(int rows, int cols, void *user)
     state->pos.row = rows - 1;
   if(state->pos.col < 0)
     state->pos.col = 0;
-  if(state->pos.col >= cols)
+  if(state->pos.col >= cols) {
     state->pos.col = cols - 1;
+    state->at_phantom = state->mode.autowrap;
+  }
 
-  updatecursor(state, &oldpos, 1);
+  updatecursor(state, &oldpos, 0);
 
   return 1;
 }

@@ -45,6 +45,35 @@
                   (error "GUI native width mismatch: %s versus %s"
                          (- after origin) cell-width))))
           (kill-buffer buffer)))
+      (let ((buffer (generate-new-buffer "*neo-term-history-check*")))
+        (unwind-protect
+            (progn
+              (pop-to-buffer buffer)
+              (neo-term-mode)
+              (setq neo-term--prompt-prefixes '("P> "))
+              (neo-term--screen
+               '((v . 1) (cols . 4) (height . 2) (x . 0) (y . 0) (visible . t)
+                 (rows . []) (continuations . [nil nil])
+                 (history_rows . [[[["P" 1 16711680 -1 1] [">" 1 16711680 -1 1]
+                                     [" " 1 16711680 -1 1] ["A" 1 16711680 -1 1]
+                                     ["B" 1 16711680 -1 1]] nil]
+                                  [[["P" 1 -1 -1 0] [">" 1 -1 -1 0] [" " 1 -1 -1 0]
+                                    ["C" 1 -1 -1 0]] nil]])))
+              (neo-term--render)
+              (unless (equal (plist-get (get-text-property 1 'face) :foreground) "#ff0000")
+                (error "Colored GUI scrollback lost its face"))
+              (goto-char (point-max))
+              (execute-kbd-macro (kbd "C-c C-p C-c C-p RET"))
+              (unless (equal (current-kill 0) "AB")
+                (error "GUI prompt navigation or wrapped copy failed"))
+              (neo-term--screen
+               '((v . 1) (cols . 8) (height . 2) (x . 0) (y . 0) (visible . t)
+                 (rows . []) (history_rows . []) (continuations . [nil nil])))
+              (neo-term--render)
+              (unless (string-prefix-p "P> AB\nP> C\n" (buffer-string))
+                (error "GUI scrollback did not reflow after widening"))
+              (redisplay t))
+          (kill-buffer buffer)))
       (dolist (backend (append '(system-conpty classic)
                                (when (file-exists-p (expand-file-name
                                                      "build/runtime/conpty.dll"
@@ -175,7 +204,7 @@
             (when (buffer-live-p buffer) (kill-buffer buffer)))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
         (insert
-         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width)\n"))
+         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; colored history/reflow/wrapped copy/prompt navigation; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

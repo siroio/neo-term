@@ -1,6 +1,170 @@
 ;;; neo-term-test.el -*- lexical-binding: t; no-byte-compile: t; -*-
 (require 'ert)
 (require 'json)
+
+(defun neo-term-test-cells (text &optional color)
+  (vconcat (mapcar (lambda (character)
+                    (vector (char-to-string character) 1 (or color -1) -1 0))
+                  (string-to-list text))))
+
+(defun neo-term-test-rich-screen (columns history &optional rows continuations)
+  (neo-term--screen
+   `((v . 1) (cols . ,columns) (height . 2) (x . 0) (y . 0) (visible . t)
+     (rows . ,(or rows [])) (history . ,history)
+     (continuations . ,(or continuations [nil nil])))))
+
+(ert-deftest neo-term-history-retains-colors-after-scroll-and-resize ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen 4 (vector (vector (neo-term-test-cells "ABCDEF" #xff0000) nil)))
+    (should (string-prefix-p "ABCD\nEF\n" (buffer-string)))
+    (should (equal (plist-get (get-text-property 1 'face) :foreground) "#ff0000"))
+    (neo-term-test-rich-screen 8 [])
+    (should (string-prefix-p "ABCDEF\n" (buffer-string)))
+    (should (equal (plist-get (get-text-property 5 'face) :foreground) "#ff0000"))))
+
+(ert-deftest neo-term-copy-removes-soft-wraps-and-preserves-explicit-newlines ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen
+     4 (vector (vector (neo-term-test-cells "ABCD") nil)
+               (vector (neo-term-test-cells "EF") t)
+               (vector (neo-term-test-cells "GH") nil)))
+    (neo-term-copy-mode 1)
+    (goto-char (point-min))
+    (let ((transient-mark-mode t) (kill-ring nil))
+      (push-mark neo-term--screen-start t t)
+      (neo-term-copy-mode-done)
+      (should (equal (current-kill 0) "ABCDEF\nGH\n")))))
+
+(ert-deftest neo-term-copy-current-line-includes-all-soft-wrapped-parts ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> "))
+    (neo-term-test-rich-screen
+     4 (vector (vector (neo-term-test-cells "P> A") nil)
+               (vector (neo-term-test-cells "BCDE") t)))
+    (neo-term-copy-mode 1)
+    (goto-char (point-min))
+    (forward-line 1)
+    (let ((kill-ring nil))
+      (neo-term-copy-mode-done)
+      (should (equal (current-kill 0) "ABCDE")))))
+
+(ert-deftest neo-term-reflow-never-splits-wide-or-combining-cells ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen
+     3 (vector (vector [["A" 1 -1 -1 0] ["日" 2 -1 -1 0]
+                        ["é" 1 -1 -1 0] ["😀" 2 -1 -1 0]] nil)))
+    (should (string-prefix-p "A日\né😀\n" (buffer-string)))
+    (neo-term-test-rich-screen 2 [])
+    (should (string-prefix-p "A\n日\né\n😀\n" (buffer-string)))
+    (neo-term-test-rich-screen 6 [])
+    (should (string-prefix-p "A日é😀\n" (buffer-string)))))
+
+(ert-deftest neo-term-prompt-navigation-enters-copy-mode-and-stops-at-input ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> "))
+    (neo-term-test-rich-screen
+     8 (vector (vector (neo-term-test-cells "P> one") nil)
+               (vector (neo-term-test-cells "output") nil)
+               (vector (neo-term-test-cells "P> two") nil)))
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should neo-term--copy)
+    (should (= (current-column) 3))
+    (should (= (line-number-at-pos) 3))
+    (neo-term-previous-prompt)
+    (should (= (line-number-at-pos) 1))
+    (neo-term-next-prompt)
+    (should (= (line-number-at-pos) 3))
+    (end-of-line)
+    (neo-term-beginning-of-line)
+    (should (= (current-column) 3))
+    (neo-term-beginning-of-line)
+    (should (= (current-column) 0))
+    (should (eq (key-binding (kbd "C-c C-p")) #'neo-term-previous-prompt))
+    (should (eq (key-binding (kbd "C-c C-n")) #'neo-term-next-prompt))))
+
+(ert-deftest neo-term-copy-joins-history-to-live-screen-without-wide-cell-padding ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen
+     3 (vector (vector (neo-term-test-cells "ABC") nil))
+     [[0 [["日" 2 -1 -1 0] [" " 1 -1 -1 0]]]
+      [1 [["D" 1 -1 -1 0] [" " 1 -1 -1 0] [" " 1 -1 -1 0]]]] [t t])
+    (neo-term--screen
+     '((v . 1) (cols . 3) (height . 2) (x . 0) (y . 0) (visible . t)
+       (rows . []) (history . []) (continuations . [t t]) (content_widths . [2 1])))
+    (neo-term-copy-mode 1)
+    (goto-char (point-min))
+    (let ((kill-ring nil))
+      (neo-term-copy-mode-done)
+      (should (equal (current-kill 0) "ABC日D")))))
+
+(ert-deftest neo-term-prompt-prefix-can-wrap-without-creating-false-prompts ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("LONG> "))
+    (neo-term-test-rich-screen
+     4 (vector (vector (neo-term-test-cells "LONG") nil)
+               (vector (neo-term-test-cells "> X") t)))
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should (= (line-number-at-pos) 2))
+    (should (= (current-column) 2))
+    (let ((kill-ring nil))
+      (neo-term-copy-mode-done)
+      (should (equal (current-kill 0) "X")))))
+
+(ert-deftest neo-term-appending-colored-history-preserves-existing-text-markers ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen 8 (vector (vector (neo-term-test-cells "first") nil)))
+    (let ((marker (copy-marker 3)))
+      (neo-term-test-rich-screen 8 (vector (vector (neo-term-test-cells "second") nil)))
+      (should (= marker 3))
+      (should (string-prefix-p "first\nsecond\n" (buffer-string))))))
+
+(ert-deftest neo-term-copy-can-retain-soft-newlines-and-literal-spaces ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen 4 (vector (vector (neo-term-test-cells "AB  ") nil)
+                                       (vector (neo-term-test-cells "CD") t)))
+    (should (equal (neo-term--copy-text (point-min) neo-term--screen-start) "AB  CD\n"))
+    (let ((neo-term-copy-remove-soft-newlines nil))
+      (should (equal (neo-term--copy-text (point-min) neo-term--screen-start) "AB  \nCD\n")))))
+
+(ert-deftest neo-term-prompt-navigation-skips-wrap-after-an-exact-width-prefix ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("PS> "))
+    (neo-term-test-rich-screen 4 (vector (vector (neo-term-test-cells "PS> X") nil)))
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should (= (line-number-at-pos) 2))
+    (should (= (current-column) 0))))
+
+(ert-deftest neo-term-overlapping-prefixes-produce-one-input-position ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> " "P> LONG "))
+    (neo-term-test-rich-screen 16 (vector (vector (neo-term-test-cells "P> LONG X") nil)))
+    (goto-char (point-max))
+    (neo-term-previous-prompt)
+    (should (= (current-column) 8))
+    (should-error (neo-term-previous-prompt) :type 'user-error)))
+
+(ert-deftest neo-term-replaced-prompt-does-not-leave-a-navigation-target ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> "))
+    (neo-term-test-rich-screen 3 [] (vector (vector 0 (neo-term-test-cells "P> "))))
+    (neo-term-test-rich-screen 3 [] (vector (vector 0 (neo-term-test-cells "abc"))))
+    (goto-char (point-max))
+    (should-error (neo-term-previous-prompt) :type 'user-error)))
 (defconst neo-term-test-root (expand-file-name ".."
                                                (file-name-directory load-file-name)))
 (let ((source (expand-file-name "../neo-term.el"

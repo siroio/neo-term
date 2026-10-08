@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <array>
 #include <cstdlib>
+#include <algorithm>
 
 namespace neo {
 class Conpty final : public Backend {
@@ -23,7 +24,9 @@ class Conpty final : public Backend {
     std::condition_variable wake_;
     std::deque<std::string> pending_;
     size_t queued_ = 0;
-    std::deque<std::string> history_;
+    std::deque<Screen::HistoryRow> history_;
+    std::vector<bool> continuations_;
+    bool resizing_ = false;
     std::thread reader_, writer_;
     std::atomic<bool> stopping_{false};
     std::string failure_;
@@ -116,30 +119,88 @@ class Conpty final : public Backend {
         return 1;
     }
 
+    void refresh_continuations(int begin, int end) {
+        if (resizing_) {
+            return;
+        }
+        int rows, cols;
+        vterm_get_size(terminal_, &rows, &cols);
+        continuations_.resize(rows);
+        auto state = vterm_obtain_state(terminal_);
+        for (int row = std::max(0, begin); row < std::min(rows, end); ++row) {
+            continuations_[row] = vterm_state_get_lineinfo(state, row)->continuation != 0;
+        }
+    }
+
+    static int damage_callback(VTermRect rect, void* user) {
+        static_cast<Conpty*>(user)->refresh_continuations(rect.start_row, rect.end_row + 1);
+        return 1;
+    }
+
+    static int move_callback(VTermRect dest, VTermRect src, void* user) {
+        static_cast<Conpty*>(user)->refresh_continuations(std::min(dest.start_row, src.start_row),
+                                                          std::max(dest.end_row, src.end_row));
+        return 1;
+    }
+
+    Cell convert_cell(const VTermScreenCell& source) {
+        Cell cell;
+        cell.text.clear();
+        for (const auto character : source.chars) {
+            if (!character) {
+                break;
+            }
+            cell.text += scalar(character);
+        }
+        if (cell.text.empty()) {
+            cell.text = " ";
+        }
+        cell.width = source.width > 0 ? source.width : 1;
+        cell.fg = color(source.fg);
+        cell.bg = color(source.bg);
+        cell.attributes = (source.attrs.bold ? 1 : 0) | (source.attrs.underline ? 2 : 0) |
+                          (source.attrs.italic ? 4 : 0) | (source.attrs.reverse ? 8 : 0) |
+                          (source.attrs.strike ? 16 : 0);
+        return cell;
+    }
+
     static int pushline_callback(int cols, const VTermScreenCell* cells, void* user) {
         auto& self = *static_cast<Conpty*>(user);
-        std::string line;
-        for (int col = 0; col < cols; ++col) {
+        bool continuation = false;
+        if (!self.continuations_.empty()) {
+            continuation = self.continuations_.front();
+            self.continuations_.erase(self.continuations_.begin());
+            self.continuations_.push_back(false);
+        }
+        return self.store_history(cols, cells, continuation);
+    }
+
+    static int reflow_pushline_callback(int cols,
+                                        const VTermScreenCell* cells,
+                                        bool continuation,
+                                        void* user) {
+        return static_cast<Conpty*>(user)->store_history(cols, cells, continuation);
+    }
+
+    int store_history(int cols, const VTermScreenCell* cells, bool continuation) {
+        Screen::HistoryRow line;
+        line.continuation = continuation;
+        int end = cols;
+        while (end > 0 && cells[end - 1].chars[0] == 0 &&
+               (cells[end - 1].bg.type & VTERM_COLOR_DEFAULT_MASK) &&
+               !cells[end - 1].attrs.reverse) {
+            --end;
+        }
+        for (int col = 0; col < end; ++col) {
             if (cells[col].chars[0] == UINT32_MAX) {
                 continue;
             }
-            for (const auto character : cells[col].chars) {
-                if (!character) {
-                    break;
-                }
-                line += scalar(character);
-            }
-            if (!cells[col].chars[0]) {
-                line += ' ';
-            }
+            line.cells.push_back(convert_cell(cells[col]));
         }
-        while (!line.empty() && line.back() == ' ') {
-            line.pop_back();
+        if (history_.size() == 2000) {
+            history_.pop_front();
         }
-        if (self.history_.size() == 2000) {
-            self.history_.pop_front();
-        }
-        self.history_.push_back(std::move(line));
+        history_.push_back(std::move(line));
         return 1;
     }
 
@@ -263,16 +324,18 @@ public:
         vterm_set_utf8(terminal_, 1);
         vterm_output_set_callback(terminal_, output_callback, this);
         screen_ = vterm_obtain_screen(terminal_);
+        vterm_screen_enable_reflow(screen_, true);
         vterm_screen_enable_altscreen(screen_, 1);
-        static const VTermScreenCallbacks callbacks = {nullptr,
-                                                       nullptr,
+        static const VTermScreenCallbacks callbacks = {damage_callback,
+                                                       move_callback,
                                                        cursor_callback,
                                                        property_callback,
                                                        nullptr,
                                                        nullptr,
                                                        pushline_callback,
                                                        nullptr,
-                                                       clear_callback};
+                                                       clear_callback,
+                                                       reflow_pushline_callback};
         vterm_screen_set_callbacks(screen_, &callbacks, this);
         static const VTermSelectionCallbacks selection_callbacks = {selection_callback, nullptr};
         vterm_state_set_selection_callbacks(vterm_obtain_state(terminal_),
@@ -333,13 +396,18 @@ public:
             return;
         }
         if (value.type == 'R') {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                resizing_ = true;
+                vterm_set_size(terminal_, value.second, value.first);
+                resizing_ = false;
+                refresh_continuations(0, value.second);
+            }
             const auto result = resize_(
                 console_, {static_cast<SHORT>(value.first), static_cast<SHORT>(value.second)});
             if (FAILED(result)) {
                 throw std::runtime_error("ConPTY resize failed");
             }
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            vterm_set_size(terminal_, value.second, value.first);
             return;
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -391,37 +459,33 @@ public:
         result.y = cursor.row;
         result.visible = visible_;
         result.alt = alt_;
+        refresh_continuations(0, result.rows);
+        result.continuations = continuations_;
         for (int row = 0; row < result.rows; ++row) {
             std::vector<Cell> line;
+            int content_width = 0;
             for (int col = 0; col < result.cols; ++col) {
                 VTermScreenCell source{};
                 vterm_screen_get_cell(screen_, {row, col}, &source);
                 if (source.chars[0] == UINT32_MAX) {
                     continue;
                 }
-                Cell cell;
-                cell.text.clear();
-                for (const auto character : source.chars) {
-                    if (!character) {
-                        break;
-                    }
-                    cell.text += scalar(character);
+                if (source.chars[0] || !(source.bg.type & VTERM_COLOR_DEFAULT_MASK) ||
+                    source.attrs.reverse) {
+                    content_width = col + std::max(1, static_cast<int>(source.width));
                 }
-                if (cell.text.empty()) {
-                    cell.text = " ";
-                }
-                cell.width = source.width > 0 ? source.width : 1;
-                cell.fg = color(source.fg);
-                cell.bg = color(source.bg);
-                cell.attributes = (source.attrs.bold ? 1 : 0) | (source.attrs.underline ? 2 : 0) |
-                                  (source.attrs.italic ? 4 : 0) | (source.attrs.reverse ? 8 : 0) |
-                                  (source.attrs.strike ? 16 : 0);
-                line.push_back(std::move(cell));
+                line.push_back(convert_cell(source));
             }
             result.lines.push_back(std::move(line));
+            result.content_widths.push_back(content_width);
         }
         for (int index = 0; index < 64 && !history_.empty(); ++index) {
-            result.history.push_back(std::move(history_.front()));
+            std::string text;
+            for (const auto& cell : history_.front().cells) {
+                text += cell.text;
+            }
+            result.history.push_back(std::move(text));
+            result.history_rows.push_back(std::move(history_.front()));
             history_.pop_front();
         }
         return result;

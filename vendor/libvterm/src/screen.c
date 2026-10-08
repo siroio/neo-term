@@ -502,10 +502,132 @@ static int line_popcount(ScreenCell *buffer, int row, int rows, int cols)
   return col + 1;
 }
 
-#define REFLOW (screen->reflow)
+static void resize_reflow(VTermScreen *screen, int new_rows, int new_cols,
+    bool active, VTermStateFields *fields)
+{
+  int old_rows = screen->rows;
+  int old_cols = screen->cols;
+  ScreenCell *old_buffer = screen->buffers[BUFIDX_PRIMARY];
+  VTermLineInfo *old_info = fields->lineinfos[BUFIDX_PRIMARY];
+  VTermPos cursor = fields->pos;
+  VTermPos new_cursor = { 0, 0 };
+  int capacity = old_rows * (old_cols * 2 + new_cols) + new_cols;
+  ScreenCell *packed = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * capacity);
+  VTermLineInfo *packed_info = vterm_allocator_malloc(screen->vt,
+      sizeof(VTermLineInfo) * (capacity / new_cols + 1));
+  int target_row = 0;
+  int target_col = 0;
+  int last_content_row = -1;
+  for(int index = 0; index < capacity; index++)
+    clearcell(screen, packed + index);
+
+  packed_info[0] = (VTermLineInfo){ 0 };
+  packed_info[0].continuation = old_info[0].continuation;
+  for(int row = 0; row < old_rows; row++) {
+    int width = line_popcount(old_buffer, row, old_rows, old_cols);
+    if(active && cursor.row == row && cursor.col > width)
+      width = cursor.col;
+    for(int col = 0; col < width;) {
+      int glyph_width = col + 1 < old_cols &&
+          old_buffer[row * old_cols + col + 1].chars[0] == (uint32_t)-1 ? 2 : 1;
+      if(target_col + glyph_width > new_cols) {
+        target_row++;
+        target_col = 0;
+        packed_info[target_row] = (VTermLineInfo){ .continuation = 1 };
+      }
+      if(active && cursor.row == row && cursor.col >= col && cursor.col < col + glyph_width) {
+        new_cursor.row = target_row;
+        new_cursor.col = target_col + (screen->state->at_phantom ? glyph_width : cursor.col - col);
+      }
+      for(int part = 0; part < glyph_width; part++) {
+        packed[target_row * new_cols + target_col + part] = old_buffer[row * old_cols + col + part];
+      }
+      if(old_buffer[row * old_cols + col].chars[0])
+        last_content_row = target_row;
+      target_col += glyph_width;
+      col += glyph_width;
+    }
+    if(active && cursor.row == row && cursor.col >= width) {
+      new_cursor.row = target_row;
+      new_cursor.col = target_col;
+    }
+    if(row + 1 == old_rows || !old_info[row + 1].continuation) {
+      target_row++;
+      target_col = 0;
+      packed_info[target_row] = (VTermLineInfo){ 0 };
+    }
+  }
+
+  if(active && !screen->state->at_phantom && new_cursor.col == new_cols) {
+    new_cursor.row++;
+    new_cursor.col = 0;
+    if(new_cursor.row > last_content_row)
+      packed_info[new_cursor.row] = (VTermLineInfo){ .continuation = 1 };
+  }
+
+  int used_rows = last_content_row + 1;
+  if(active && used_rows <= new_cursor.row)
+    used_rows = new_cursor.row + 1;
+  if(used_rows < 1)
+    used_rows = 1;
+  int first_row = used_rows > new_rows ? used_rows - new_rows : 0;
+  if(active && new_cursor.row < first_row)
+    first_row = new_cursor.row;
+
+  if(first_row > 0 && screen->callbacks) {
+    ScreenCell *saved_buffer = screen->buffer;
+    screen->buffer = packed;
+    screen->rows = used_rows;
+    screen->cols = new_cols;
+    for(int row = 0; row < first_row; row++) {
+      for(int col = 0; col < new_cols; col++)
+        vterm_screen_get_cell(screen, (VTermPos){ row, col }, screen->sb_buffer + col);
+      if(screen->callbacks->sb_pushline_reflow)
+        screen->callbacks->sb_pushline_reflow(new_cols, screen->sb_buffer,
+            packed_info[row].continuation, screen->cbdata);
+      else if(screen->callbacks->sb_pushline)
+        screen->callbacks->sb_pushline(new_cols, screen->sb_buffer, screen->cbdata);
+    }
+    screen->buffer = saved_buffer;
+    screen->rows = old_rows;
+    screen->cols = old_cols;
+  }
+
+  ScreenCell *resized = vterm_allocator_malloc(screen->vt,
+      sizeof(ScreenCell) * new_rows * new_cols);
+  VTermLineInfo *resized_info = vterm_allocator_malloc(screen->vt,
+      sizeof(VTermLineInfo) * new_rows);
+  for(int row = 0; row < new_rows; row++) {
+    resized_info[row] = row + first_row < used_rows
+      ? packed_info[row + first_row] : (VTermLineInfo){ 0 };
+    for(int col = 0; col < new_cols; col++) {
+      if(row + first_row < used_rows)
+        resized[row * new_cols + col] = packed[(row + first_row) * new_cols + col];
+      else
+        clearcell(screen, resized + row * new_cols + col);
+    }
+  }
+  screen->buffers[BUFIDX_PRIMARY] = resized;
+  fields->lineinfos[BUFIDX_PRIMARY] = resized_info;
+  if(active) {
+    fields->pos.row = new_cursor.row - first_row;
+    fields->pos.col = new_cursor.col;
+    screen->state->at_phantom = 0;
+  }
+  vterm_allocator_free(screen->vt, old_buffer);
+  vterm_allocator_free(screen->vt, old_info);
+  vterm_allocator_free(screen->vt, packed);
+  vterm_allocator_free(screen->vt, packed_info);
+}
+
+#define REFLOW false
 
 static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new_cols, bool active, VTermStateFields *statefields)
 {
+  if(screen->reflow && bufidx == BUFIDX_PRIMARY) {
+    resize_reflow(screen, new_rows, new_cols, active, statefields);
+    return;
+  }
   int old_rows = screen->rows;
   int old_cols = screen->cols;
 

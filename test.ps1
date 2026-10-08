@@ -11,6 +11,10 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'Native specifications failed.'
     }
+    & ./build/vterm-reflow-test.exe
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Terminal reflow specifications failed.'
+    }
 
     & $Python -X utf8 -m unittest discover -s tests -p test_host.py
     if ($LASTEXITCODE -ne 0) {

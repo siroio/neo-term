@@ -29,6 +29,40 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
     const std::wstring mode = argc > 1 ? argv[1] : L"unicode";
+    if (mode == L"reflow-cursor") {
+        DWORD input_mode;
+        GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode);
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),
+                       input_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+        print(L"A日B");
+        wchar_t character;
+        DWORD received;
+        if (ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), &character, 1, &received, nullptr)) {
+            print(std::wstring(1, character));
+        }
+        Sleep(INFINITE);
+        return 0;
+    }
+    if (mode == L"reflow") {
+        print(L"ABCDEFGHIJKLMN");
+        Sleep(INFINITE);
+        return 0;
+    }
+    if (mode == L"rich-history") {
+        DWORD output_mode;
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_mode);
+        SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE),
+                       output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        Sleep(100);
+        print(L"\x1b[31;1mABCDEFGHIJKLMNOPQRSTUVWXYZ\x1b[0m\r\n");
+        for (int index = 0; index < 12; ++index) {
+            print(L"hard " + std::to_wstring(index) + L"\r\n");
+            Sleep(60);
+        }
+        print(L"RICH_READY");
+        Sleep(INFINITE);
+        return 0;
+    }
     if (mode == L"sleeper") {
         Sleep(INFINITE);
         return 0;

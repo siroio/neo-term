@@ -81,11 +81,29 @@ public:
                             ",\"alt\":" + (screen.alt ? "true" : "false") +
                             ",\"mouse\":" + std::to_string(screen.mouse) +
                             ",\"title\":" + json_string(screen.title);
-        if (!changed && cursor == cursor_ && screen.history.empty() && !screen.history_cleared &&
-            screen.clipboard.empty()) {
+        std::string continuations = "[";
+        for (const auto continuation : screen.continuations) {
+            if (continuations.size() > 1) {
+                continuations += ',';
+            }
+            continuations += continuation ? "true" : "false";
+        }
+        continuations += ']';
+        std::string content_widths = "[";
+        for (const auto width : screen.content_widths) {
+            if (content_widths.size() > 1) {
+                content_widths += ',';
+            }
+            content_widths += std::to_string(width);
+        }
+        content_widths += ']';
+        const auto state = cursor + ",\"continuations\":" + continuations +
+                           ",\"content_widths\":" + content_widths;
+        if (!changed && state == cursor_ && screen.history.empty() && screen.history_rows.empty() &&
+            !screen.history_cleared && screen.clipboard.empty()) {
             return {};
         }
-        cursor_ = cursor;
+        cursor_ = state;
         std::string history = "[";
         for (const auto& line : screen.history) {
             if (history.size() > 1) {
@@ -94,6 +112,23 @@ public:
             history += json_string(line);
         }
         history += ']';
+        std::string history_rows = "[";
+        for (const auto& row : screen.history_rows) {
+            if (history_rows.size() > 1) {
+                history_rows += ',';
+            }
+            history_rows += "[[";
+            bool first = true;
+            for (const auto& cell : row.cells) {
+                if (!first) {
+                    history_rows += ',';
+                }
+                first = false;
+                history_rows += cell_json(cell);
+            }
+            history_rows += row.continuation ? "],true]" : "],false]";
+        }
+        history_rows += ']';
         std::string clipboard = "[";
         for (const auto& text : screen.clipboard) {
             if (clipboard.size() > 1) {
@@ -104,8 +139,8 @@ public:
         clipboard += ']';
         return "{\"type\":\"screen\",\"v\":1,\"generation\":" + std::to_string(++generation_) +
                ",\"cols\":" + std::to_string(screen.cols) +
-               ",\"height\":" + std::to_string(screen.rows) + ',' + cursor + ",\"rows\":" + rows +
-               ",\"history\":" + history +
+               ",\"height\":" + std::to_string(screen.rows) + ',' + state + ",\"rows\":" + rows +
+               ",\"history\":" + history + ",\"history_rows\":" + history_rows +
                ",\"history_cleared\":" + (screen.history_cleared ? "true" : "false") +
                ",\"clipboard\":" + clipboard + '}';
     }

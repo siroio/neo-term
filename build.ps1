@@ -86,6 +86,17 @@ try {
             "$root/native/classic.cpp"
         )
 
+        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include "$root/tests/vterm-reflow-test.cpp" @objects /Fe:vterm-reflow-test.exe
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Terminal reflow test compilation failed.'
+        }
+        if ($Test) {
+            & ./vterm-reflow-test.exe
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Terminal reflow specifications failed.'
+            }
+        }
+
         & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include @hostSources @objects /Fe:neo-term-host.exe user32.lib
 
         if ($LASTEXITCODE -ne 0) {

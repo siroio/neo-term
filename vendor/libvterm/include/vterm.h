@@ -541,6 +541,7 @@ typedef struct {
   int (*sb_pushline)(int cols, const VTermScreenCell *cells, void *user);
   int (*sb_popline)(int cols, VTermScreenCell *cells, void *user);
   int (*sb_clear)(void* user);
+  int (*sb_pushline_reflow)(int cols, const VTermScreenCell *cells, bool continuation, void *user);
 } VTermScreenCallbacks;
 
 VTermScreen *vterm_obtain_screen(VTerm *vt);

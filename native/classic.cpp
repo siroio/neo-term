@@ -7,6 +7,8 @@ class Classic final : public Backend {
     std::mutex mutex_;
     bool attached_ = false;
     std::vector<std::string> previous_;
+    std::vector<std::vector<Cell>> previous_cells_;
+    int previous_top_ = 0;
     bool history_cleared_ = false;
 
     static BOOL WINAPI ignore_control(DWORD) {
@@ -46,7 +48,9 @@ class Classic final : public Backend {
                      output_.get(),
                      {static_cast<SHORT>(cols), static_cast<SHORT>(std::max(rows, 1000))}),
                  "SetConsoleScreenBufferSize");
-        SMALL_RECT window{0, 0, static_cast<SHORT>(cols - 1), static_cast<SHORT>(rows - 1)};
+        const auto top = static_cast<SHORT>(
+            std::min(static_cast<int>(current.srWindow.Top), std::max(rows, 1000) - rows));
+        SMALL_RECT window{0, top, static_cast<SHORT>(cols - 1), static_cast<SHORT>(top + rows - 1)};
         wincheck(SetConsoleWindowInfo(output_.get(), TRUE, &window), "SetConsoleWindowInfo");
         options_.cols = cols;
         options_.rows = rows;
@@ -166,10 +170,15 @@ public:
         if (value.type == 'L') {
             clear_console(output_.get());
             previous_.clear();
+            previous_top_ = 0;
             return;
         }
         if (value.type == 'H') {
             previous_.clear();
+            CONSOLE_SCREEN_BUFFER_INFO information{};
+            wincheck(GetConsoleScreenBufferInfo(output_.get(), &information),
+                     "GetConsoleScreenBufferInfo");
+            previous_top_ = information.srWindow.Top;
             history_cleared_ = true;
             return;
         }
@@ -242,58 +251,98 @@ public:
         result.x = information.dwCursorPosition.X - information.srWindow.Left;
         result.y = information.dwCursorPosition.Y - information.srWindow.Top;
         result.visible = cursor.bVisible != 0;
-        std::vector<CHAR_INFO> source(static_cast<size_t>(result.cols) * result.rows);
-        auto region = information.srWindow;
-        wincheck(
-            ReadConsoleOutputW(output_.get(),
-                               source.data(),
-                               {static_cast<SHORT>(result.cols), static_cast<SHORT>(result.rows)},
-                               {0, 0},
-                               &region),
-            "ReadConsoleOutputW");
-        std::vector<std::string> text_lines;
-        for (int row = 0; row < result.rows; ++row) {
-            std::vector<Cell> line;
-            std::string text;
-            for (int col = 0; col < result.cols; ++col) {
-                const auto& value = source[static_cast<size_t>(row) * result.cols + col];
-                if (value.Attributes & COMMON_LVB_TRAILING_BYTE) {
-                    continue;
-                }
-                Cell cell;
-                uint32_t character = value.Char.UnicodeChar;
-                cell.width = value.Attributes & COMMON_LVB_LEADING_BYTE ? 2 : 1;
-                if (character >= 0xd800 && character <= 0xdbff && col + 1 < result.cols) {
-                    const auto low =
-                        source[static_cast<size_t>(row) * result.cols + col + 1].Char.UnicodeChar;
-                    if (low >= 0xdc00 && low <= 0xdfff) {
-                        character = 0x10000 + ((character - 0xd800) << 10) + low - 0xdc00;
-                        cell.width = 2;
-                        ++col;
+        result.continuations.assign(result.rows, false);
+        result.content_widths.assign(result.rows, result.cols);
+        auto read_region = [&](SMALL_RECT region) {
+            const int height = region.Bottom - region.Top + 1;
+            std::vector<CHAR_INFO> source(static_cast<size_t>(result.cols) * height);
+            wincheck(
+                ReadConsoleOutputW(output_.get(),
+                                   source.data(),
+                                   {static_cast<SHORT>(result.cols), static_cast<SHORT>(height)},
+                                   {0, 0},
+                                   &region),
+                "ReadConsoleOutputW");
+            std::vector<std::vector<Cell>> lines;
+            for (int row = 0; row < height; ++row) {
+                std::vector<Cell> line;
+                for (int col = 0; col < result.cols; ++col) {
+                    const auto& value = source[static_cast<size_t>(row) * result.cols + col];
+                    if (value.Attributes & COMMON_LVB_TRAILING_BYTE) {
+                        continue;
                     }
+                    Cell cell;
+                    uint32_t character = value.Char.UnicodeChar;
+                    cell.width = value.Attributes & COMMON_LVB_LEADING_BYTE ? 2 : 1;
+                    if (character >= 0xd800 && character <= 0xdbff && col + 1 < result.cols) {
+                        const auto low = source[static_cast<size_t>(row) * result.cols + col + 1]
+                                             .Char.UnicodeChar;
+                        if (low >= 0xdc00 && low <= 0xdfff) {
+                            character = 0x10000 + ((character - 0xd800) << 10) + low - 0xdc00;
+                            cell.width = 2;
+                            ++col;
+                        }
+                    }
+                    cell.text = scalar(character);
+                    cell.fg = rgb(information.ColorTable[value.Attributes & 15]);
+                    cell.bg = rgb(information.ColorTable[(value.Attributes >> 4) & 15]);
+                    cell.attributes = (value.Attributes & COMMON_LVB_UNDERSCORE ? 2 : 0) |
+                                      (value.Attributes & COMMON_LVB_REVERSE_VIDEO ? 8 : 0);
+                    line.push_back(std::move(cell));
                 }
-                cell.text = scalar(character);
-                cell.fg = rgb(information.ColorTable[value.Attributes & 15]);
-                cell.bg = rgb(information.ColorTable[(value.Attributes >> 4) & 15]);
-                cell.attributes = (value.Attributes & COMMON_LVB_UNDERSCORE ? 2 : 0) |
-                                  (value.Attributes & COMMON_LVB_REVERSE_VIDEO ? 8 : 0);
+                lines.push_back(std::move(line));
+            }
+            return lines;
+        };
+        result.lines = read_region(information.srWindow);
+        std::vector<std::string> text_lines;
+        for (const auto& line : result.lines) {
+            std::string text;
+            for (const auto& cell : line) {
                 text += cell.text;
-                line.push_back(std::move(cell));
             }
             text_lines.push_back(std::move(text));
-            result.lines.push_back(std::move(line));
         }
-        if (previous_.size() == text_lines.size() && !text_lines.empty() &&
-            previous_[0] != text_lines[0]) {
+        const int moved = information.srWindow.Top - previous_top_;
+        auto append_history = [&](std::vector<Cell> cells) {
+            std::string text;
+            for (const auto& cell : cells) {
+                text += cell.text;
+            }
+            result.history.push_back(std::move(text));
+            const auto background =
+                rgb(information.ColorTable[(information.wAttributes >> 4) & 15]);
+            while (!cells.empty() && cells.back().text == " " && cells.back().bg == background &&
+                   cells.back().attributes == 0) {
+                cells.pop_back();
+            }
+            result.history_rows.push_back({std::move(cells), false});
+        };
+        if (moved > 0) {
+            const int count = std::min(moved, 64);
+            auto region = information.srWindow;
+            region.Top = static_cast<SHORT>(previous_top_);
+            region.Bottom = static_cast<SHORT>(previous_top_ + count - 1);
+            for (auto& line : read_region(region)) {
+                append_history(std::move(line));
+            }
+            previous_top_ += count;
+        } else if (previous_.size() == text_lines.size() && !text_lines.empty() &&
+                   previous_[0] != text_lines[0]) {
             for (size_t shift = 1; shift < previous_.size(); ++shift) {
-                if (std::equal(
-                        text_lines.begin(), text_lines.end() - shift, previous_.begin() + shift)) {
-                    result.history.assign(previous_.begin(), previous_.begin() + shift);
+                const auto matched = previous_.size() - shift - (previous_.size() > 2 ? 1 : 0);
+                if (matched > 0 && std::equal(text_lines.begin(),
+                                              text_lines.begin() + matched,
+                                              previous_.begin() + shift)) {
+                    for (size_t row = 0; row < shift; ++row) {
+                        append_history(previous_cells_[row]);
+                    }
                     break;
                 }
             }
         }
         previous_ = std::move(text_lines);
+        previous_cells_ = result.lines;
         return result;
     }
 
