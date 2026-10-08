@@ -1,6 +1,6 @@
 ;;; neo-term.el --- Windows native terminal for Emacs -*- lexical-binding: t; -*-
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 (require 'cl-lib)
@@ -30,6 +30,27 @@
   :type '(repeat string))
 (defcustom neo-term-scrollback-lines 2000 "Maximum retained history lines."
   :type 'natnum)
+(defcustom neo-term-shell-integration t
+  "Track directories and prompts for ordinary PowerShell sessions."
+  :type 'boolean)
+(defcustom neo-term-copy-exclude-prompt t
+  "Exclude a tracked prompt when copying the current line."
+  :type 'boolean)
+(defcustom neo-term-clear-scrollback-when-clearing nil
+  "Also clear scrollback when clearing the console screen."
+  :type 'boolean)
+(defcustom neo-term-buffer-name-string nil
+  "Optional buffer name format containing %s for the terminal title."
+  :type '(choice (const nil) string))
+(defcustom neo-term-kill-buffer-on-exit nil
+  "Kill the terminal buffer when its process exits."
+  :type 'boolean)
+(defcustom neo-term-enable-osc52 nil
+  "Allow terminal OSC 52 output to copy text into the kill ring and clipboard."
+  :type 'boolean)
+(defcustom neo-term-enable-mouse t
+  "Send mouse input when a ConPTY application requests mouse reporting."
+  :type 'boolean)
 (defconst neo-term--max-frame (* 4 1024 1024))
 (defvar-local neo-term--process nil)
 (defvar-local neo-term--session nil)
@@ -47,6 +68,15 @@
 (defvar-local neo-term--requested-size nil)
 (defvar-local neo-term--status "starting")
 (defvar-local neo-term--glyph-cache nil)
+(defvar-local neo-term--screen-start nil)
+(defvar-local neo-term--row-markers [])
+(defvar-local neo-term--rendered-lines [])
+(defvar-local neo-term--rendered-history nil)
+(defvar-local neo-term--render-layout nil)
+(defvar-local neo-term--title "")
+(defvar-local neo-term--raw-title nil)
+(defvar-local neo-term--prompt-prefixes nil)
+(defvar-local neo-term--mouse 0)
 (defvar neo-term-mode-map)
 (defvar neo-term-copy-mode-map)
 
@@ -150,6 +180,9 @@
       (error "Terminal cell widths do not match columns"))))
 
 (defun neo-term--screen (event)
+  (neo-term--receive-clipboard (alist-get 'clipboard event))
+  (when (alist-get 'title event)
+    (neo-term--update-title (alist-get 'title event)))
   (when (alist-get 'history_cleared event)
     (setq neo-term--history nil))
   (let ((cols (alist-get 'cols event))
@@ -173,6 +206,10 @@
           neo-term--cursor (cons x y)
           neo-term--visible (alist-get 'visible event)
           neo-term--alt (alist-get 'alt event))
+    (setq neo-term--mouse (or (alist-get 'mouse event) 0))
+    (unless (memq neo-term--mouse '(0 1 2 3))
+      (error "Invalid terminal mouse mode"))
+    (setq-local track-mouse (and neo-term-enable-mouse (> neo-term--mouse 1)))
     (cl-loop for row across (alist-get 'rows event) do
              (unless (and (vectorp row)
                           (= (length row) 2)
@@ -260,39 +297,161 @@
 (defun neo-term--render ()
   (let ((inhibit-read-only t)
         (neo-term--updating t)
-        (cursor-position nil)
-        (screen-start nil))
-    (erase-buffer)
-    (unless neo-term--alt
-      (dolist (line neo-term--history)
-        (insert line "\n")))
-    (setq screen-start (point))
-    (dotimes (row neo-term--height)
-      (let ((column 0)
-            (cells (aref neo-term--lines row)))
-        (if (null cells)
-            (insert (make-string neo-term--cols ?\s))
-          (cl-loop for cell across cells do
-                   (when (and (= row (cdr neo-term--cursor))
-                              (null cursor-position)
-                              (>= column (car neo-term--cursor)))
-                     (setq cursor-position (point)))
-                   (neo-term--insert-cell cell)
-                   (cl-incf column (aref cell 1))))
-        (when (and (= row (cdr neo-term--cursor))
-                   (null cursor-position))
-          (setq cursor-position (point))))
-      (unless (= row (1- neo-term--height))
-        (insert "\n")))
-    (goto-char (or cursor-position screen-start))
+        (layout (list neo-term--cols neo-term--height neo-term--alt
+                      (frame-parameter nil 'font) (frame-char-width)
+                      (frame-char-height) (face-foreground 'default nil t)
+                      (face-background 'default nil t))))
+    (if (equal layout neo-term--render-layout)
+        (progn
+          (neo-term--sync-history)
+          (dotimes (row neo-term--height)
+            (unless (equal (aref neo-term--lines row)
+                           (aref neo-term--rendered-lines row))
+              (goto-char (aref neo-term--row-markers row))
+              (let ((begin (point)))
+                (delete-region begin (line-end-position))
+                (neo-term--insert-row row)
+                (set-marker (aref neo-term--row-markers row) begin)))))
+      (neo-term--rebuild-screen)
+      (setq neo-term--render-layout layout))
+    (setq neo-term--rendered-lines (copy-sequence neo-term--lines))
+    (when (> neo-term--height 0)
+      (set-marker neo-term--screen-start (aref neo-term--row-markers 0)))
+    (goto-char (neo-term--cursor-position))
     (setq cursor-type (if neo-term--visible 'box nil))
     (dolist (window (get-buffer-window-list (current-buffer) nil t))
-      (set-window-start window screen-start t)
+      (set-window-start window neo-term--screen-start t)
       (set-window-point window (point)))
     (neo-term--restore-display-protection)
-    (add-text-properties (point-min) (point-max)
-                         '(read-only t front-sticky (read-only)))
     (set-buffer-modified-p nil)))
+
+(defun neo-term--insert-row (row)
+  (let ((begin (point))
+        (cells (aref neo-term--lines row)))
+    (if cells
+        (cl-loop for cell across cells do (neo-term--insert-cell cell))
+      (insert (make-string neo-term--cols ?\s)))
+    (add-text-properties begin (point)
+                         '(read-only t front-sticky (read-only)))
+    (neo-term--mark-prompt begin (point))))
+
+(defun neo-term--insert-history (lines)
+  (dolist (line lines)
+    (let ((begin (point)))
+      (insert (propertize (concat line "\n")
+                          'read-only t 'front-sticky '(read-only)))
+      (neo-term--mark-prompt begin (1- (point))))))
+
+(defun neo-term--mark-prompt (begin end)
+  (let ((text (buffer-substring-no-properties begin end)))
+    (dolist (prefix neo-term--prompt-prefixes)
+      (when (string-prefix-p prefix text)
+        (put-text-property begin (+ begin (length prefix)) 'neo-term-prompt t)))))
+
+(defun neo-term--update-title (raw-title)
+  (when (and (stringp raw-title) (<= (length raw-title) 16384)
+             (not (equal raw-title neo-term--raw-title)))
+    (setq neo-term--raw-title raw-title)
+    (if (string-prefix-p "neo-term;" raw-title)
+        (condition-case nil
+            (let* ((json (decode-coding-string
+                          (base64-decode-string (substring raw-title 9)) 'utf-8 t))
+                   (metadata (json-parse-string json :object-type 'alist))
+                   (directory (alist-get 'directory metadata))
+                   (prompt (alist-get 'prompt metadata))
+                   (title (alist-get 'title metadata)))
+              (when (and (stringp directory)
+                         (string-match-p "\\`[A-Za-z]:[/\\\\]" directory)
+                         (file-directory-p directory))
+                (setq default-directory (file-name-as-directory directory)))
+              (when (and (stringp prompt) (< 0 (length prompt) 1024)
+                         (not (string-match-p "[\r\n]" prompt))
+                         (not (member prompt neo-term--prompt-prefixes)))
+                (push prompt neo-term--prompt-prefixes)
+                (setq neo-term--prompt-prefixes
+                      (cl-subseq neo-term--prompt-prefixes
+                                 0 (min 64 (length neo-term--prompt-prefixes)))
+                      neo-term--render-layout nil))
+              (when (stringp title) (neo-term--set-title title)))
+          (error nil))
+      (neo-term--set-title raw-title))))
+
+(defun neo-term--set-title (title)
+  (let ((clean (replace-regexp-in-string "[[:cntrl:]]" "" title)))
+    (setq neo-term--title (substring clean 0 (min 256 (length clean)))))
+  (when (and neo-term-buffer-name-string (not (string-empty-p neo-term--title)))
+    (rename-buffer (format neo-term-buffer-name-string neo-term--title) t)))
+
+(defun neo-term--receive-clipboard (texts)
+  (when texts
+    (unless (and (vectorp texts) (<= (length texts) 8))
+      (error "Invalid terminal clipboard events"))
+    (cl-loop for text across texts do
+             (unless (and (stringp text) (<= (string-bytes text) 65536))
+               (error "Invalid terminal clipboard text"))
+             (when neo-term-enable-osc52 (kill-new text)))))
+
+(defun neo-term--rebuild-screen ()
+  (cl-loop for marker across neo-term--row-markers do (set-marker marker nil))
+  (erase-buffer)
+  (setq neo-term--rendered-history
+        (unless neo-term--alt (copy-sequence neo-term--history)))
+  (neo-term--insert-history neo-term--rendered-history)
+  (setq neo-term--screen-start (copy-marker (point) t)
+        neo-term--row-markers (make-vector neo-term--height nil))
+  (dotimes (row neo-term--height)
+    (aset neo-term--row-markers row (copy-marker (point) t))
+    (neo-term--insert-row row)
+    (set-marker (aref neo-term--row-markers row)
+                (save-excursion (beginning-of-line) (point)))
+    (unless (= row (1- neo-term--height))
+      (insert (propertize "\n" 'read-only t))))
+  (set-marker neo-term--screen-start
+              (if (> neo-term--height 0)
+                  (aref neo-term--row-markers 0)
+                (point-max))))
+
+(defun neo-term--history-overlap (current previous)
+  (let ((remaining (length current))
+        (candidate-length (length previous))
+        found)
+    (while (and current previous (not found))
+      (when (and (eq (car current) (car previous))
+                 (<= candidate-length remaining)
+                 (cl-loop for old in previous for new in current always (eq old new)))
+        (setq found previous))
+      (unless found
+        (setq previous (cdr previous))
+        (cl-decf candidate-length)))
+    found))
+
+(defun neo-term--sync-history ()
+  (let ((current (unless neo-term--alt neo-term--history)))
+    (unless (equal current neo-term--rendered-history)
+      (let* ((overlap (neo-term--history-overlap current neo-term--rendered-history))
+             (retained (length overlap))
+             (removed (- (length neo-term--rendered-history) retained)))
+        (goto-char (point-min))
+        (forward-line removed)
+        (delete-region (point-min) (point))
+        (goto-char neo-term--screen-start)
+        (neo-term--insert-history (nthcdr retained current))
+        (setq neo-term--rendered-history (copy-sequence current))))))
+
+(defun neo-term--cursor-position ()
+  (if (= neo-term--height 0)
+      (point-min)
+    (let* ((row (cdr neo-term--cursor))
+           (position (marker-position (aref neo-term--row-markers row)))
+           (cells (aref neo-term--lines row))
+           (column 0))
+      (if cells
+          (cl-loop for cell across cells
+                   while (< column (car neo-term--cursor))
+                   do (cl-incf position (length (aref cell 0)))
+                   (cl-incf column (aref cell 1)))
+        (cl-incf position (car neo-term--cursor)))
+      position)))
 
 (defun neo-term--protect-display (_begin _end)
   (unless neo-term--updating
@@ -380,16 +539,48 @@
   (interactive)
   (neo-term--send "K10,0"))
 
+(defun neo-term-send-mouse (event)
+  "Send mouse EVENT to a requesting application, or select and browse text."
+  (interactive "e")
+  (let* ((basic (event-basic-type event))
+         (modifiers (event-modifiers event))
+         (position (event-end event))
+         (window (posn-window position))
+         (coordinates (posn-col-row position))
+         (button (cdr (assq basic '((mouse-1 . 1) (mouse-2 . 2) (mouse-3 . 3)
+                                    (wheel-up . 4) (wheel-down . 5))))))
+    (if (and neo-term-enable-mouse (> neo-term--mouse 0) (not neo-term--copy)
+             (windowp window) (eq (window-buffer window) (current-buffer)))
+        (let ((column (car coordinates))
+              (row (cdr coordinates))
+              (bits (+ (if (memq 'shift modifiers) 1 0)
+                       (if (memq 'meta modifiers) 2 0)
+                       (if (memq 'control modifiers) 4 0))))
+          (when (and (integerp row) (integerp column)
+                     (<= 0 row) (< row neo-term--height)
+                     (<= 0 column) (< column neo-term--cols))
+            (let ((pressed (or (memq 'down modifiers) (memq basic '(wheel-up wheel-down)))))
+              (neo-term--send (format "M%s,%s,%s,%s" row column
+                                      (if button (if pressed button (- button)) 0) bits)))))
+      (cond ((memq basic '(wheel-up wheel-down))
+             (neo-term-copy-mode 1)
+             (if (eq basic 'wheel-up) (scroll-down-command 3) (scroll-up-command 3)))
+            ((eq basic 'mouse-1)
+             (if (memq 'down modifiers) (mouse-drag-region event) (mouse-set-point event)))))))
+
 (defun neo-term-interrupt ()
   "Send Ctrl+C to the CLI."
   (interactive)
   (neo-term--resume-input)
   (neo-term--send "U99,4"))
 
-(defun neo-term-clear ()
+(defun neo-term-clear (&optional invert)
   "Clear the console screen while keeping the CLI and scrollback."
-  (interactive)
+  (interactive "P")
   (neo-term--resume-input)
+  (when (if invert (not neo-term-clear-scrollback-when-clearing)
+          neo-term-clear-scrollback-when-clearing)
+    (neo-term--send "H"))
   (neo-term--send "L"))
 
 (defun neo-term-clear-scrollback ()
@@ -407,15 +598,35 @@
   (interactive (list (current-kill 0)))
   (neo-term--resume-input)
   (neo-term--send (concat "P" text)))
-(defun neo-term-copy-mode ()
+(defun neo-term-copy-mode (&optional argument)
   "Toggle selection and history browsing."
-  (interactive)
-  (setq neo-term--copy (not neo-term--copy))
+  (interactive "P")
+  (setq neo-term--copy (if argument (> (prefix-numeric-value argument) 0)
+                        (not neo-term--copy)))
   (setq buffer-read-only t)
   (use-local-map (if neo-term--copy neo-term-copy-mode-map neo-term-mode-map))
   (if neo-term--copy (setq cursor-type 'bar)
     (neo-term--render))
   (force-mode-line-update))
+
+(defun neo-term-copy-mode-done (&optional invert)
+  "Copy the selection or current line, then resume terminal input.
+INVERT reverses `neo-term-copy-exclude-prompt' for this copy."
+  (interactive "P")
+  (unless neo-term--copy (user-error "Enable terminal copy mode first"))
+  (let ((text
+         (if (use-region-p)
+             (buffer-substring-no-properties (region-beginning) (region-end))
+           (let ((begin (line-beginning-position))
+                 (end (line-end-position)))
+             (when (and (if invert (not neo-term-copy-exclude-prompt)
+                          neo-term-copy-exclude-prompt)
+                        (get-text-property begin 'neo-term-prompt))
+               (setq begin (next-single-property-change begin 'neo-term-prompt nil end)))
+             (string-trim-right (buffer-substring-no-properties begin end))))))
+    (kill-new text))
+  (deactivate-mark)
+  (neo-term-copy-mode -1))
 (defun neo-term-close ()
   "Close the terminal and its child processes."
   (interactive)
@@ -434,7 +645,7 @@
 (defvar neo-term-command-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c") #'neo-term-interrupt)
-    (define-key map (kbd "C-l") #'neo-term-clear)
+    (define-key map (kbd "C-l") #'neo-term-clear-scrollback)
     (define-key map (kbd "M-l") #'neo-term-clear-scrollback)
     (define-key map (kbd "C-t") #'neo-term-copy-mode)
     (define-key map (kbd "C-v") #'neo-term-paste)
@@ -471,6 +682,12 @@
     (define-key map [remap read-only-mode] #'neo-term-copy-mode)
     (define-key map [down-mouse-1] #'mouse-drag-region)
     (define-key map [mouse-1] #'mouse-set-point)
+    (dolist (event '(down-mouse-1 mouse-1 drag-mouse-1 down-mouse-2 mouse-2
+                                 down-mouse-3 mouse-3 wheel-up wheel-down mouse-movement))
+      (dolist (modifiers '(nil (shift) (meta) (control) (shift meta)
+                              (shift control) (meta control) (shift meta control)))
+        (define-key map (vector (event-convert-list (append modifiers (list event))))
+                    #'neo-term-send-mouse)))
     (define-key map (kbd "C-g") #'keyboard-quit)
     (define-key map (kbd "C-q") #'neo-term-send-next-key)
     (define-key map (kbd "C-y") #'neo-term-paste)
@@ -484,6 +701,9 @@
     (define-key map [remap read-only-mode] #'neo-term-copy-mode)
     (define-key map (kbd "C-c") neo-term-command-map)
     (define-key map (kbd "M-w") #'kill-ring-save)
+    (define-key map (kbd "RET") #'neo-term-copy-mode-done)
+    (define-key map [return] #'neo-term-copy-mode-done)
+    (define-key map (kbd "C-l") #'neo-term-clear)
     (define-key map "q" #'neo-term-copy-mode)
     map))
 
@@ -528,6 +748,26 @@
                                     (cdr size)))))))))
 (add-hook 'window-size-change-functions #'neo-term--resize)
 
+(defun neo-term--shell-arguments ()
+  (if (and neo-term-shell-integration
+           (member (downcase (file-name-base neo-term-shell)) '("powershell" "pwsh"))
+           (cl-every (lambda (argument)
+                       (member (downcase argument) '("-nologo" "-noprofile" "-noexit")))
+                     neo-term-shell-arguments))
+      (append neo-term-shell-arguments
+              (unless (member "-noexit" (mapcar #'downcase neo-term-shell-arguments))
+                '("-NoExit"))
+              (list "-EncodedCommand"
+                    (base64-encode-string
+                     (encode-coding-string
+                      (with-temp-buffer
+                        (insert-file-contents (expand-file-name "shell/neo-term.ps1"
+                                                               neo-term--directory))
+                        (buffer-string))
+                      'utf-16le t)
+                     t)))
+    neo-term-shell-arguments))
+
 (defun neo-term--host-command (size)
   (append
    (list neo-term-host-program
@@ -539,7 +779,7 @@
          (number-to-string (cdr size)))
    (when neo-term-no-conpty '("--no-conpty"))
    (list "--" neo-term-shell)
-   neo-term-shell-arguments))
+   (neo-term--shell-arguments)))
 
 (defun neo-term--process-filter (process bytes)
   (when (buffer-live-p (process-buffer process))
@@ -557,7 +797,17 @@
     (with-current-buffer (process-buffer process)
       (unless (string-prefix-p "exit " neo-term--status)
         (setq neo-term--status (string-trim event)))
-      (force-mode-line-update))))
+      (force-mode-line-update)
+      (when (and neo-term-kill-buffer-on-exit
+                 (memq (process-status process) '(exit signal)))
+        (kill-buffer (current-buffer))))))
+
+;;;###autoload
+(defun neo-term-other-window ()
+  "Start a terminal in another window."
+  (interactive)
+  (let ((display-buffer-overriding-action '(display-buffer-pop-up-window)))
+    (neo-term)))
 
 ;;;###autoload
 (defun neo-term ()

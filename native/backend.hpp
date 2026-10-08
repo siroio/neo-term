@@ -129,6 +129,9 @@ struct Screen {
     bool visible = true;
     bool alt = false;
     bool history_cleared = false;
+    std::string title;
+    int mouse = 0;
+    std::vector<std::string> clipboard;
     std::vector<std::vector<Cell>> lines;
     std::vector<std::string> history;
 };

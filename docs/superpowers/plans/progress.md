@@ -35,3 +35,10 @@ Follow-up mode: 既存のneo-term-modeを強化。表示文字の読み取り専
 Follow-up clear: LはWin32の画面消去、Hは履歴消去。ConPTYはCLIコンソールへ一時接続して消去し、シェル文字列は送らない。Hの完了はscreen.history_clearedで通知して、先行する履歴フレームとの順序を保つ。
 Follow-up review: 独立レビューで変更フックの例外による解除を確認。コマンド終了時・描画時の再登録を追加して解決。履歴が溜まった状態の統合テストも追加。他のImportantなし。
 Follow-up verification: build.ps1 -Test と test.ps1 -Gui → native PASS、host15/15、ERT16/16、警告なしbytecompile、3バックエンドGUI PASS。cmd/PowerShellで入力途中の文字列を保持したクリアも確認。clang-format/Black/git diff --check通過。
+
+vterm parity: 差分描画、RETでコピーして復帰、プロンプト除外、PowerShell cwd/prompt/title、別ウィンドウ、任意の終了時バッファ破棄、OSC52の既定無効コピー、要求されたマウス入力を追加。
+vterm parity RED/GREEN: 変更行・履歴位置、コピー、メタデータ、キー、OSC52、マウスに再現テストを追加。PowerShellの実行ポリシーは変更せず、EncodedCommandで付属コードを起動する。
+vterm parity review: 独立レビューの3件（screen-start移動、ドラッグ終了座標、PowerShellの$?）を再現して修正。プロンプトは最初に呼び出し、LASTEXITCODEにも余分な代入をしない。
+vterm parity performance: 同一条件の200更新、履歴2000行/80列24行。カーソルのみ5.152→0.030秒、1変更行5.484→0.211秒。vtermとの直接比較ではない。
+vterm parity limits: 標準ConPTYでマウスモードが転送されない場合があり、このPCでは同梱版で確認。classicマウス、カラー履歴、折り返し行の結合、UNC/WSL/TRAMP追跡は未対応としてREADMEへ記録。
+vterm parity verification: native PASS、CLI20/20（実機Vimを含む）、ERT28/28、警告なしbytecompile、3バックエンドGUI・同梱版マウス PASS。PowerShellテストのstderrはバイトで収集して混在する文字コードによる検証スレッドの例外を解消。書式チェック通過。

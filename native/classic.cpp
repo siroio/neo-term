@@ -160,6 +160,9 @@ public:
 
     void command(const Command& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (value.type == 'M') {
+            return;
+        }
         if (value.type == 'L') {
             clear_console(output_.get());
             previous_.clear();
@@ -231,6 +234,9 @@ public:
         wincheck(GetConsoleCursorInfo(output_.get(), &cursor), "GetConsoleCursorInfo");
         Screen result;
         result.history_cleared = std::exchange(history_cleared_, false);
+        std::wstring title(32768, L'\0');
+        title.resize(GetConsoleTitleW(title.data(), static_cast<DWORD>(title.size())));
+        result.title = utf8(title);
         result.cols = information.srWindow.Right - information.srWindow.Left + 1;
         result.rows = information.srWindow.Bottom - information.srWindow.Top + 1;
         result.x = information.dwCursorPosition.X - information.srWindow.Left;

@@ -78,8 +78,11 @@ public:
         const auto cursor = "\"x\":" + std::to_string(screen.x) +
                             ",\"y\":" + std::to_string(screen.y) +
                             ",\"visible\":" + (screen.visible ? "true" : "false") +
-                            ",\"alt\":" + (screen.alt ? "true" : "false");
-        if (!changed && cursor == cursor_ && screen.history.empty() && !screen.history_cleared) {
+                            ",\"alt\":" + (screen.alt ? "true" : "false") +
+                            ",\"mouse\":" + std::to_string(screen.mouse) +
+                            ",\"title\":" + json_string(screen.title);
+        if (!changed && cursor == cursor_ && screen.history.empty() && !screen.history_cleared &&
+            screen.clipboard.empty()) {
             return {};
         }
         cursor_ = cursor;
@@ -91,11 +94,20 @@ public:
             history += json_string(line);
         }
         history += ']';
+        std::string clipboard = "[";
+        for (const auto& text : screen.clipboard) {
+            if (clipboard.size() > 1) {
+                clipboard += ',';
+            }
+            clipboard += json_string(text);
+        }
+        clipboard += ']';
         return "{\"type\":\"screen\",\"v\":1,\"generation\":" + std::to_string(++generation_) +
                ",\"cols\":" + std::to_string(screen.cols) +
                ",\"height\":" + std::to_string(screen.rows) + ',' + cursor + ",\"rows\":" + rows +
                ",\"history\":" + history +
-               ",\"history_cleared\":" + (screen.history_cleared ? "true" : "false") + '}';
+               ",\"history_cleared\":" + (screen.history_cleared ? "true" : "false") +
+               ",\"clipboard\":" + clipboard + '}';
     }
 };
 }

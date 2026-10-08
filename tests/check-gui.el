@@ -94,7 +94,7 @@
                         (delete-region (point-min) (point-max)))
                       (error "Terminal display was editable"))
                   (user-error nil))
-                (execute-kbd-macro (kbd "C-c C-l"))
+                (execute-kbd-macro (kbd "C-l"))
                 (when neo-term--copy (error "Clear did not resume input mode"))
                 (neo-term-gui-wait
                  (lambda () (string-empty-p (string-trim (buffer-string)))))
@@ -128,9 +128,54 @@
                                                             (buffer-string))))))
               (when (buffer-live-p buffer)
                 (kill-buffer buffer))))))
+      (dolist (backend '(system-conpty classic bundled-conpty))
+        (when (or (not (eq backend 'bundled-conpty))
+                  (file-exists-p (expand-file-name "build/runtime/conpty.dll" neo-term-gui-root)))
+          (let* ((neo-term-backend backend)
+                 (neo-term-shell "powershell.exe")
+                 (neo-term-shell-arguments '("-NoLogo" "-NoProfile"))
+                 (buffer (neo-term))
+                 (destination (expand-file-name "build" neo-term-gui-root)))
+            (unwind-protect
+                (with-current-buffer buffer
+                  (neo-term-gui-wait
+                   (lambda () (string-prefix-p "PowerShell:" neo-term--title)))
+                  (neo-term--send (format "TSet-Location '%s'" destination))
+                  (neo-term--send "K1,0")
+                  (neo-term-gui-wait
+                   (lambda () (equal (downcase default-directory)
+                                      (downcase (file-name-as-directory destination)))))
+                  (neo-term-gui-wait
+                   (lambda () (save-excursion
+                                (goto-char (neo-term--cursor-position))
+                                (get-text-property (line-beginning-position)
+                                                   'neo-term-prompt))))
+                  (execute-kbd-macro (kbd "C-c C-t RET"))
+                  (unless (string-empty-p (current-kill 0))
+                    (error "Copy retained PowerShell prompt")))
+              (when (buffer-live-p buffer) (kill-buffer buffer))))))
+      (when (file-exists-p (expand-file-name "build/runtime/conpty.dll" neo-term-gui-root))
+        (let* ((neo-term-backend 'bundled-conpty)
+               (neo-term-shell (expand-file-name "build/console-fixture.exe" neo-term-gui-root))
+               (neo-term-shell-arguments '("mouse"))
+               (buffer (neo-term)))
+          (unwind-protect
+              (with-current-buffer buffer
+                (neo-term-gui-wait
+                 (lambda () (and (> neo-term--mouse 0)
+                                 (string-match-p "FIXTURE_READY" (buffer-string)))))
+                (redisplay t)
+                (let ((position (posn-at-point (+ (aref neo-term--row-markers 2) 4))))
+                  (unless position (error "Mouse cell was not visible"))
+                  (execute-kbd-macro
+                   (vector (list 'down-mouse-1 position) (list 'mouse-1 position))))
+                (neo-term-gui-wait
+                 (lambda () (and (string-match-p "MOUSE=4,2 BUTTONS=1" (buffer-string))
+                                 (string-match-p "MOUSE=4,2 BUTTONS=0" (buffer-string))))))
+            (when (buffer-live-p buffer) (kill-buffer buffer)))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
         (insert
-         "GUI_TESTS=PASS (installed backends; input, resize, interrupt, protected copy, Backspace/Delete, clear and continued input; ConPTY TUI/truecolor/alternate screen; Unicode pixel width)\n"))
+         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

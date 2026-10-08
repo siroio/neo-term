@@ -1,6 +1,8 @@
 #include "backend.hpp"
 #include <vterm.h>
 #include <condition_variable>
+#include <array>
+#include <cstdlib>
 
 namespace neo {
 class Conpty final : public Backend {
@@ -27,6 +29,13 @@ class Conpty final : public Backend {
     std::string failure_;
     bool visible_ = true, alt_ = false;
     bool history_cleared_ = false;
+    std::string title_, pending_title_;
+    bool title_overflow_ = false;
+    int mouse_ = 0;
+    std::array<char, 4096> selection_buffer_{};
+    std::string pending_selection_;
+    bool selection_overflow_ = false;
+    std::deque<std::string> clipboard_;
     std::vector<unsigned char> attributes_;
 
     static void output_callback(const char* bytes, size_t length, void* user) {
@@ -54,6 +63,50 @@ class Conpty final : public Backend {
         }
         if (property == VTERM_PROP_ALTSCREEN) {
             self.alt_ = value->boolean != 0;
+        }
+        if (property == VTERM_PROP_TITLE) {
+            const auto fragment = value->string;
+            if (fragment.initial) {
+                self.pending_title_.clear();
+                self.title_overflow_ = false;
+            }
+            if (self.pending_title_.size() + fragment.len > 16384) {
+                self.title_overflow_ = true;
+            }
+            if (!self.title_overflow_) {
+                self.pending_title_.append(fragment.str, fragment.len);
+            }
+            if (fragment.final && !self.title_overflow_) {
+                self.title_ = self.pending_title_;
+            }
+        }
+        if (property == VTERM_PROP_MOUSE) {
+            self.mouse_ = value->number;
+        }
+        return 1;
+    }
+
+    static int selection_callback(VTermSelectionMask, VTermStringFragment fragment, void* user) {
+        auto& self = *static_cast<Conpty*>(user);
+        if (fragment.initial) {
+            self.pending_selection_.clear();
+            self.selection_overflow_ = false;
+        }
+        if (self.pending_selection_.size() + fragment.len > 65536) {
+            self.selection_overflow_ = true;
+        }
+        if (!self.selection_overflow_) {
+            self.pending_selection_.append(fragment.str, fragment.len);
+        }
+        if (fragment.final && !self.selection_overflow_) {
+            try {
+                wide(self.pending_selection_);
+                if (self.clipboard_.size() == 8) {
+                    self.clipboard_.pop_front();
+                }
+                self.clipboard_.push_back(self.pending_selection_);
+            } catch (const std::exception&) {
+            }
         }
         return 1;
     }
@@ -221,6 +274,12 @@ public:
                                                        nullptr,
                                                        clear_callback};
         vterm_screen_set_callbacks(screen_, &callbacks, this);
+        static const VTermSelectionCallbacks selection_callbacks = {selection_callback, nullptr};
+        vterm_state_set_selection_callbacks(vterm_obtain_state(terminal_),
+                                            &selection_callbacks,
+                                            this,
+                                            selection_buffer_.data(),
+                                            selection_buffer_.size());
         vterm_screen_reset(screen_, 1);
         reader_ = std::thread([this] {
             read_output();
@@ -284,7 +343,13 @@ public:
             return;
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (value.type == 'H') {
+        if (value.type == 'M') {
+            const auto modifiers = static_cast<VTermModifier>(value.fourth);
+            vterm_mouse_move(terminal_, value.first, value.second, modifiers);
+            if (value.third != 0) {
+                vterm_mouse_button(terminal_, std::abs(value.third), value.third > 0, modifiers);
+            }
+        } else if (value.type == 'H') {
             history_.clear();
             history_cleared_ = true;
         } else if (value.type == 'K') {
@@ -315,6 +380,10 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex_);
         Screen result;
         result.history_cleared = std::exchange(history_cleared_, false);
+        result.title = title_;
+        result.mouse = mouse_;
+        result.clipboard.assign(clipboard_.begin(), clipboard_.end());
+        clipboard_.clear();
         vterm_get_size(terminal_, &result.rows, &result.cols);
         VTermPos cursor;
         vterm_state_get_cursorpos(vterm_obtain_state(terminal_), &cursor);

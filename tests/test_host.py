@@ -11,6 +11,7 @@ import ctypes
 import re
 import tempfile
 import shutil
+import base64
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = ROOT / "build" / "neo-term-host.exe"
@@ -228,6 +229,102 @@ class HostSpecifications(unittest.TestCase):
                 self.assertEqual(session.history, [])
                 session.send("Tz")
                 session.until(lambda e: "CHAR=122" in session.text())
+
+    def test_powershell_prompt_reports_directory_and_keeps_custom_prompt(self):
+        script = ROOT / "shell" / "neo-term.ps1"
+        destination = ROOT / "build"
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                startup = "function prompt { 'CUSTOM> ' }; " + script.read_text(encoding="utf-8")
+                session, _ = self.run_session(
+                    backend,
+                    [
+                        "powershell.exe",
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NoExit",
+                        "-EncodedCommand",
+                        base64.b64encode(startup.encode("utf-16le")).decode("ascii"),
+                    ],
+                )
+                event = session.until(lambda e: e.get("title", "").startswith("neo-term;"))
+                metadata = json.loads(base64.b64decode(event["title"][9:]).decode("utf-8"))
+                self.assertEqual(metadata["prompt"], "CUSTOM> ")
+                if "CUSTOM>" not in session.text():
+                    session.until(lambda e: "CUSTOM>" in session.text())
+                session.send(f"TSet-Location '{destination.as_posix()}'")
+                session.send("K1,0")
+
+                def changed_directory(event):
+                    title = event.get("title", "")
+                    if not title.startswith("neo-term;"):
+                        return False
+                    data = json.loads(base64.b64decode(title[9:]).decode("utf-8"))
+                    return Path(data["directory"]) == destination
+
+                session.until(changed_directory)
+
+    def test_powershell_custom_prompt_preserves_failed_status_and_native_exit_code(self):
+        script = (ROOT / "shell" / "neo-term.ps1").read_text(encoding="utf-8")
+        code = (
+            "function prompt { 'status:' + $? + ':' + $global:LASTEXITCODE }; "
+            + script
+            + "\n$global:LASTEXITCODE = 7; "
+            + "Get-Item -LiteralPath 'E:/neo-emacs/neo-term/build/does-not-exist' "
+            + "-ErrorAction SilentlyContinue; prompt"
+        )
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-EncodedCommand",
+                base64.b64encode(code.encode("utf-16le")).decode("ascii"),
+            ],
+            capture_output=True,
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self.assertIn(b"status:False:7", result.stdout)
+
+    def test_osc52_unicode_clipboard_data_reaches_the_frontend(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "clipboard"])
+                event = session.until(lambda e: bool(e.get("clipboard")))
+                self.assertEqual(event["clipboard"], ["日本語😀"])
+
+    def test_mouse_input_reaches_a_requesting_console_application(self):
+        for backend in (kind for kind in BACKENDS if kind != "classic"):
+            with self.subTest(backend=backend):
+                session, _ = self.run_session(backend, [FIXTURE, "mouse"])
+                session.until(lambda e: "FIXTURE_READY" in session.text())
+                if session.screen.get("mouse", 0) == 0:
+                    self.assertEqual(backend, "system-conpty")
+                    continue
+                session.send("M2,4,1,0")
+                session.until(lambda e: "MOUSE=4,2 BUTTONS=1" in session.text())
+                session.send("M2,4,-1,0")
+                session.until(lambda e: "MOUSE=4,2 BUTTONS=0" in session.text())
+
+    def test_vim_edits_and_saves_a_file(self):
+        vim = os.environ.get("NEO_TERM_TEST_VIM") or shutil.which("vim.exe")
+        if not vim:
+            self.skipTest("set NEO_TERM_TEST_VIM to run a real Vim integration")
+        for backend in BACKENDS:
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory(
+                dir=HOST.parent
+            ) as folder:
+                path = Path(folder) / "vim-result.txt"
+                session, _ = self.run_session(
+                    backend, [vim, "-Nu", "NONE", "-n", "-i", "NONE", str(path)]
+                )
+                session.until(lambda e: "vim-result.txt" in session.text())
+                session.send("TiNEO_VIM_OK")
+                session.send("K4,0")
+                session.send("T:wq")
+                session.send("K1,0")
+                session.until(lambda e: e["type"] == "exit")
+                self.assertEqual(path.read_text(encoding="utf-8").strip(), "NEO_VIM_OK")
 
     def test_pipe_disconnect_releases_owned_processes(self):
         for backend in BACKENDS:

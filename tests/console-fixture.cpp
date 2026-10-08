@@ -85,12 +85,25 @@ int wmain(int argc, wchar_t** argv) {
         Sleep(300);
         return 0;
     }
+    if (mode == L"clipboard" || mode == L"mouse") {
+        DWORD output_mode;
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_mode);
+        SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE),
+                       output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if (mode == L"clipboard") {
+            print(L"\x1b]52;c;5pel5pys6Kqe8J+YgA==\x07");
+            Sleep(500);
+            return 0;
+        }
+        print(L"\x1b[?1000h\x1b[?1006h");
+    }
     SetConsoleCtrlHandler(interrupted, TRUE);
     DWORD input_mode;
     GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode);
-    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),
-                   (input_mode | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT) &
-                       ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+    SetConsoleMode(
+        GetStdHandle(STD_INPUT_HANDLE),
+        (input_mode | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT) &
+            ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
     if (mode == L"history") {
         for (int index = 0; index < 300; ++index) {
             print(L"history " + std::to_wstring(index) + L"\r\n");
@@ -103,6 +116,11 @@ int wmain(int argc, wchar_t** argv) {
         if (event.EventType == KEY_EVENT && event.Event.KeyEvent.bKeyDown) {
             print(L"KEY=" + std::to_wstring(event.Event.KeyEvent.wVirtualKeyCode) + L" CHAR=" +
                   std::to_wstring(event.Event.KeyEvent.uChar.UnicodeChar) + L"\r\n");
+        }
+        if (event.EventType == MOUSE_EVENT) {
+            print(L"MOUSE=" + std::to_wstring(event.Event.MouseEvent.dwMousePosition.X) + L"," +
+                  std::to_wstring(event.Event.MouseEvent.dwMousePosition.Y) + L" BUTTONS=" +
+                  std::to_wstring(event.Event.MouseEvent.dwButtonState) + L"\r\n");
         }
     }
     return 0;

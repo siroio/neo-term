@@ -47,6 +47,18 @@ int main() {
     require(parse_command("R80,24").first == 80, "resize preserves requested columns");
     require(parse_command("L").type == 'L', "screen clear has no shell text");
     require(parse_command("H").type == 'H', "history clear is independent from screen clear");
+    require(parse_command("M2,4,-1,7").third == -1,
+            "mouse release preserves position, button and modifiers");
+    for (const auto& invalid :
+         {"M200,0,1,0", "M0,300,1,0", "M0,0,6,0", "M0,0,1,8", "M0,0,1", "M0,0,1,0,0"}) {
+        rejected = false;
+        try {
+            parse_command(invalid);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        require(rejected, "mouse fields must be complete and within terminal bounds");
+    }
     rejected = false;
     try {
         parse_command("Lcls");

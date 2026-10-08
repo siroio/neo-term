@@ -203,7 +203,7 @@
   (with-temp-buffer
     (neo-term-mode)
     (should (eq (key-binding (kbd "C-c C-c")) #'neo-term-interrupt))
-    (should (eq (key-binding (kbd "C-c C-l")) #'neo-term-clear))
+    (should (eq (key-binding (kbd "C-c C-l")) #'neo-term-clear-scrollback))
     (should (eq (key-binding (kbd "C-l")) #'neo-term-clear))
     (should (eq (key-binding (kbd "C-c M-l")) #'neo-term-clear-scrollback))
     (should (eq (key-binding (kbd "C-x C-q")) #'neo-term-copy-mode))
@@ -251,3 +251,167 @@
        (rows . []) (history . []) (history_cleared . t)))
     (should-not neo-term--history)
     (should (string-prefix-p "X " (buffer-string)))))
+
+(ert-deftest neo-term-cursor-only-updates-do-not-rewrite-buffer-text ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (let ((tick (buffer-chars-modified-tick)))
+      (neo-term--screen
+       '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 1)
+         (visible . t) (rows . []) (history . [])))
+      (should (= tick (buffer-chars-modified-tick)))
+      (should (= (line-number-at-pos) 3)))))
+
+(ert-deftest neo-term-row-updates-preserve-unchanged-history-and-screen-markers ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (let ((history-marker (copy-marker 2))
+          (row-marker (copy-marker 8)))
+      (neo-term--screen
+       '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 0)
+         (visible . t) (rows . [[0 [["日" 2 -1 -1 0]]]]) (history . [])))
+      (should (= history-marker 2))
+      (should (= row-marker 7))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "old\n日\n  ")))))
+
+(ert-deftest neo-term-history-appends-before-a-rewritten-first-screen-row ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (neo-term--screen
+     '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 0) (visible . t)
+       (rows . [[0 [["A" 1 -1 -1 0] ["B" 1 -1 -1 0]]]]) (history . [])))
+    (neo-term--screen
+     '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 0) (visible . t)
+       (rows . []) (history . ["new"])))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "old\nnew\nAB\n  "))
+    (should (= neo-term--screen-start (aref neo-term--row-markers 0)))))
+
+(ert-deftest neo-term-history-growth-and-trimming-retain-the-live-screen ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (let ((neo-term-scrollback-lines 2))
+      (neo-term--screen
+       '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 0)
+         (visible . t) (rows . []) (history . ["new1" "new2"])))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "new1\nnew2\nX \n  "))
+      (let ((neo-term-scrollback-lines 0))
+        (neo-term--screen
+         '((v . 1) (cols . 2) (height . 2) (x . 0) (y . 0)
+           (visible . t) (rows . []) (history . ["new3"])))
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       "X \n  "))))))
+
+(ert-deftest neo-term-copy-return-copies-selection-and-resumes-input ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (neo-term-copy-mode)
+    (goto-char (point-min))
+    (let ((transient-mark-mode t) (kill-ring nil))
+      (push-mark (+ (point) 3) t t)
+      (call-interactively (key-binding (kbd "RET")))
+      (should (equal (current-kill 0) "old"))
+      (should-not neo-term--copy)
+      (should buffer-read-only))))
+
+(ert-deftest neo-term-shell-metadata-tracks-local-directory-and-excludes-prompt ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let* ((directory (expand-file-name ".." neo-term-test-root))
+           (metadata (json-serialize `((directory . ,directory)
+                                       (prompt . "PS> ") (title . "PowerShell"))))
+           (title (concat "neo-term;" (base64-encode-string
+                                       (encode-coding-string metadata 'utf-8) t))))
+      (neo-term--screen
+       `((v . 1) (cols . 6) (height . 2) (x . 5) (y . 0) (visible . t)
+         (title . ,title)
+         (rows . [[0 [["P" 1 -1 -1 0] ["S" 1 -1 -1 0] [">" 1 -1 -1 0]
+                      [" " 1 -1 -1 0] ["X" 1 -1 -1 0] [" " 1 -1 -1 0]]]])
+         (history . [])))
+      (should (equal default-directory (file-name-as-directory directory)))
+      (should (equal neo-term--title "PowerShell"))
+      (neo-term-copy-mode)
+      (goto-char (point-min))
+      (let ((kill-ring nil))
+        (neo-term-copy-mode-done)
+        (should (equal (current-kill 0) "X"))))))
+
+(ert-deftest neo-term-invalid-shell-metadata-cannot-change-directory ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((directory default-directory))
+      (neo-term--update-title "neo-term;not-base64-json")
+      (should (equal default-directory directory))
+      (let ((metadata (json-serialize '((directory . "/ssh:remote:/tmp")
+                                        (prompt . "X> ") (title . "remote")))))
+        (neo-term--update-title
+         (concat "neo-term;" (base64-encode-string metadata t)))
+        (should (equal default-directory directory))))))
+
+(ert-deftest neo-term-custom-powershell-command-is-not-replaced-by-integration ()
+  (let ((neo-term-shell "powershell.exe")
+        (neo-term-shell-arguments '("-Command" "'custom'")))
+    (should (equal (neo-term--shell-arguments) neo-term-shell-arguments)))
+  (let ((neo-term-shell "powershell.exe")
+        (neo-term-shell-arguments '("-NoLogo" "-NoProfile")))
+    (should (member "-NoExit" (neo-term--shell-arguments)))
+    (should (member "-EncodedCommand" (neo-term--shell-arguments)))))
+
+(ert-deftest neo-term-title-control-characters-are-removed ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term--update-title "title\n\t")
+    (should (equal neo-term--title "title"))))
+
+(ert-deftest neo-term-osc52-copy-requires-explicit-opt-in ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((kill-ring '("unchanged")))
+      (neo-term--receive-clipboard ["日本語😀"])
+      (should (equal kill-ring '("unchanged")))
+      (let ((neo-term-enable-osc52 t))
+        (neo-term--receive-clipboard ["日本語😀"])
+        (should (equal (current-kill 0) "日本語😀")))
+      (should-error (neo-term--receive-clipboard [1])))))
+
+(ert-deftest neo-term-requested-mouse-input-preserves-button-release-and-modifiers ()
+  (let ((buffer (generate-new-buffer "*neo-term-mouse-test*")))
+    (unwind-protect
+        (progn
+          (switch-to-buffer buffer)
+          (neo-term-mode)
+          (neo-term-test-screen)
+          (setq neo-term--mouse 1)
+          (let ((position (list (selected-window) 1 '(0 . 0) 0 nil 1 '(0 . 0))) sent)
+            (cl-letf (((symbol-function 'neo-term--send)
+                       (lambda (command) (push command sent))))
+              (neo-term-send-mouse (list 'C-down-mouse-1 position))
+              (let ((end (list (selected-window) 2 '(1 . 0) 0 nil 2 '(1 . 0))))
+                (neo-term-send-mouse (list 'C-drag-mouse-1 position end))))
+            (should (equal (reverse sent) '("M0,0,1,4" "M0,1,-1,4")))))
+      (kill-buffer buffer))))
+
+(ert-deftest neo-term-resuming-copy-mode-catches-up-after-resize-and-alternate-screen ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-screen)
+    (neo-term-copy-mode 1)
+    (let ((before (buffer-string)))
+      (neo-term--screen
+       '((v . 1) (cols . 3) (height . 2) (x . 1) (y . 0) (visible . t)
+         (alt . t) (rows . [[0 [["Z" 1 -1 -1 0] [" " 1 -1 -1 0]
+                                [" " 1 -1 -1 0]]]]) (history . ["later"])))
+      (should (equal before (buffer-string))))
+    (neo-term-copy-mode -1)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "Z  \n   "))
+    (neo-term--screen
+     '((v . 1) (cols . 3) (height . 2) (x . 1) (y . 0) (visible . t)
+       (alt . nil) (rows . []) (history . [])))
+    (should (string-prefix-p "old\nlater\nZ" (buffer-string)))))

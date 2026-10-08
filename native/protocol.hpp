@@ -117,6 +117,8 @@ struct Command {
     std::string text;
     int first = 0;
     int second = 0;
+    int third = 0;
+    int fourth = 0;
 };
 
 inline Command parse_command(const std::string& payload) {
@@ -129,6 +131,28 @@ inline Command parse_command(const std::string& payload) {
         return result;
     }
     if ((result.type == 'C' || result.type == 'L' || result.type == 'H') && result.text.empty()) {
+        return result;
+    }
+    if (result.type == 'M') {
+        int fields[4]{};
+        size_t position = 0;
+        for (int index = 0; index < 4; ++index) {
+            const auto comma = result.text.find(',', position);
+            if ((index < 3 && comma == std::string::npos) ||
+                (index == 3 && comma != std::string::npos)) {
+                throw std::runtime_error("Mouse command requires row,column,button,modifiers");
+            }
+            fields[index] = integer(result.text.substr(position, comma - position));
+            position = comma + 1;
+        }
+        result.first = fields[0];
+        result.second = fields[1];
+        result.third = fields[2];
+        result.fourth = fields[3];
+        if (result.first < 0 || result.first >= 200 || result.second < 0 || result.second >= 300 ||
+            result.third < -5 || result.third > 5 || result.fourth < 0 || result.fourth > 7) {
+            throw std::runtime_error("Invalid mouse coordinates, button or modifiers");
+        }
         return result;
     }
     if (result.type != 'R' && result.type != 'K' && result.type != 'U') {
