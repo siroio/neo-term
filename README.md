@@ -1,6 +1,6 @@
 # neo-term
 
-Windows版Emacsのバッファ内でWindowsのCLIを操作する端末パッケージです。Emacsに読み込んだC++のDLLがConPTYを制御し、Emacs Lispが画面と入力を扱います。
+Windows版Emacsのバッファ内でWindowsのCLIを操作する端末パッケージです。Emacsに読み込んだC++のDLLがConPTYと独自の端末エンジンを制御し、Emacs Lispが画面と入力を扱います。端末エンジンにlibvtermを使用しません。
 
 ## 導入
 
@@ -79,7 +79,7 @@ cmd.exeは起動用スクリプトで既存のPROMPTを包み、Git Bashは既�
 
 ConPTYでは画面幅による折り返しと明示的な改行を区別します。`RET` の現在行コピーは、カーソルが折り返しの途中にあっても論理行全体をコピーします。`RET` の範囲コピーと `M-w` も折り返しだけの改行を除き、明示的な改行と実際の空白は保持します。`neo-term-copy-remove-soft-newlines` を `nil` にすると画面上の改行もコピーします。
 
-履歴にはセルの色・背景・太字・下線などを保持します。ウィンドウ幅の変更時は履歴の論理行を新しい幅で再配置し、日本語・絵文字・結合文字のセルを分割しません。ConPTYの現在画面もlibvtermのreflowを使います。コピーモード中は表示を固定し、戻るとリサイズと出力に追いつきます。履歴上限は保存した元の行数なので、幅を狭めると表示上の行数は増えます。
+履歴にはセルの色・背景・太字・下線などを保持します。ウィンドウ幅の変更時は履歴の論理行を新しい幅で再配置し、日本語・絵文字・結合文字のセルを分割しません。ConPTYの現在画面は独自エンジンで再配置します。コピーモード中は表示を固定し、戻るとリサイズと出力に追いつきます。履歴上限は保存した元の行数なので、幅を狭めると表示上の行数は増えます。
 
 `C-c C-p` / `C-c C-n` はコピーモードへ入り、追跡済みの前／次のプロンプトの入力開始位置へ移動します。数値引数で移動数を指定できます。コピーモードの `C-a` は入力開始位置へ移動し、そこでもう一度押すと論理行の先頭へ移動します。幅によってプロンプトが折り返されても追跡します。
 
@@ -105,15 +105,14 @@ ConPTYではOSC 52によるコピーにも対応します。既定は無効で�
 
 ## 検証と制限
 
-ネイティブ契約・libvterm再配置/分割VTテスト、DLL経由のCLI統合40件、ERT46件、DLL統合20件、警告なしのbyte compile、GUIを検証します。CLIテストは実際のEmacsにDLLを読み込ませるテスト用Lispから制御し、仲介EXEを使いません。従来API固有のテストは削除し、出力が詰まった状態の非同期終了はDLL統合テストで確認します。
+ネイティブ契約・独自エンジンの再配置/分割VTテスト、実際のEmacs経由のCLI統合、ERT、DLL統合、警告なしのbyte compile、GUIを検証します。CLIテストは実際のEmacsにDLLを読み込ませるテスト用Lispから制御し、仲介EXEを使いません。出力が詰まった状態の非同期終了はDLL統合テストで確認します。
 
-日本語・絵文字・結合文字、40回のリサイズ、3000行の履歴末尾、Ctrl+C、子孫プロセスの終了、30回の起動/GC、セッション別cwd/環境、DLL不足/初期化失敗、画面クリア、PowerShell/cmd/Git Bashの通知、実際のVimでのUnicode保存を検証します。GUIでは入力・コピー・色・代替画面・プロンプト・カーソル・ファイル要求・同梱ConPTYのマウスを確認します。
+日本語・絵文字・結合文字、反復リサイズ、3000行の履歴末尾、Ctrl+C、子孫プロセスの終了、30回の起動/GC、セッション別cwd/環境、DLL不足/初期化失敗、画面クリア、PowerShell/cmd/Git Bashの通知を検証します。GUIではEmacsのキー操作による入力とコピー、色・代替画面・プロンプト・カーソル・ファイル要求・同梱ConPTYのマウスを確認します。Vimを起動するテストはありません。
 
-開発時はVisual StudioのC++ツールを使ってビルドします。テストにはPython 3、動的モジュール対応Emacs、同梱ConPTYが必要です。Vimは `NEO_TERM_TEST_VIM` またはPATHで指定し、見つからない場合はスキップします。
+開発時はVisual StudioのC++ツールを使ってビルドします。テストにはPython 3、動的モジュール対応Emacs、同梱ConPTYが必要です。
 
 ```powershell
 .\build.ps1 -Test
-$env:NEO_TERM_TEST_VIM = 'C:/path/to/vim.exe'
 .\test.ps1 -Gui -Python 'C:/path/to/python.exe' -Emacs 'C:/path/to/emacs.exe'
 ```
 
@@ -121,9 +120,15 @@ $env:NEO_TERM_TEST_VIM = 'C:/path/to/vim.exe'
 
 DLL化時の同じEmacsによるバッチ測定では、入力から描画までの中央値は約1.9ms、起動から3000行出力・最終描画・終了まで約1.87秒でした。GUIの実測値ではありません。再測定は `emacs -Q --batch -l tests/benchmark-module.el` で行えます。描画処理の測定は `tests/benchmark-render.el` です。
 
-変更行と履歴の増減だけを描画し、カーソルだけの更新では文字を書き換えません。ConPTYの出力がある場合だけ画面を取得し、通常の通知は8msでまとめます。未送信の履歴が64行以上ある間は待たずに送信します。親の終了後はJob Object内の子孫を終了させ、出力のEOFと残った履歴を確認してから終了を通知します。
+変更行と履歴の増減だけを描画し、カーソルだけの更新では文字を書き換えません。ConPTYの出力を専用スレッドで待ち、VT解析時に変更行を記録します。通知を作る際はその行だけを取得・JSON化し、差分検出のための全セル走査は行いません。出力・入力・シェル通知・プロセス終了のイベントでワーカーを起こし、アイドル中の画面取得は行いません。通知後の固定8ms待ちとEmacs側の固定20ms描画待ちはありません。行内の文字はまとめてバッファへ挿入し、フォント情報は描画ごとに取得します。未送信の履歴が64行以上ある間は待たずに送信します。親の終了後はJob Object内の子孫を終了させ、出力のEOFと残った履歴を確認してから終了を通知します。
 
-Unicode 16.0.0の文字幅・結合文字表を使用します。複数コードポイントからなる絵文字の全組み合わせ、画像、任意のTUIの完全互換は保証していません。標準ConPTYでは反復リサイズで入力末尾を上書きするケースがあり、同梱ConPTYでは末尾保持を確認しています。標準ConPTYのVim保存で一度タイムアウトしたことがあり、単独再実行とその後の全CLIテストは成功しましたが原因は未特定です。
+通常のGUIタイマー経路を通す入力測定は `emacs -Q -l tests/benchmark-input.el` で実行できます。`NEO_TERM_BENCH_SHELL=powershell.exe` を設定すると通常のシェル入力を測定します。結果は `build/input-benchmark.log` へ保存します。Emacsのキーマップを通した入力からredisplayまでの測定で、物理キーの配送と画面走査は含みません。
+
+Unicode 16.0.0の文字幅・結合文字表を使用します。1セルに保持する文字は基底文字を含め16コードポイントまでで、超過する結合文字は読み飛ばします。複数コードポイントからなる絵文字の全組み合わせ、画像、任意のTUIの完全互換は保証していません。未対応のDCS画像・端末機能問い合わせは読み飛ばします。リサイズでは現在画面のカーソルを再配置しますが、別途保存したカーソル位置は復元時に画面内へ制限します。プロンプト位置は出力と順序が一致するOSC 133を使用し、別チャネルで届くコンソール座標からの推測は行いません。標準ConPTYでは反復リサイズで入力末尾を上書きするケースがあり、同梱ConPTYで末尾保持を検証します。
+
+2026-10-09の表示最適化では、変更セルだけを置換し、未変更のプロンプト属性を保持します。通常のセルには値のない表示属性を付けません。履歴・表示構成が変わらない入力では、プロンプト検索を現在画面と必要な前の文脈に限定します。GUI EmacsとPowerShellによるbyte compile済みの最終比較では、通常入力の中央値が約7.6〜7.9msから約6.0〜6.7msに短縮しました。2000件のプロンプト履歴を生成した負荷では、検索範囲の限定により約12.3〜13.7msから約8.1msへ短縮しました。通常入力のバッファ更新は約0.09〜0.10msですが、GUI再表示にはなお約5msかかり、全体0.2msには達していません。物理キーの配送と画面走査は含みません。
+
+切り分け用の `tests/profile-display.el` はGUI版Emacsで、`tests/profile-prompts.el` はバッチ版Emacsで実行します。`tests/benchmark-input.el` に `NEO_TERM_BENCH_HISTORY=2000` を設定すると、PowerShell経由でOSC 133付きのプロンプト履歴を生成した後に入力を測定できます。詳細は `docs/superpowers/plans/2026-10-09-input-latency-profile.md` にあります。
 
 ## 構成とライセンス
 
@@ -131,8 +136,8 @@ Unicode 16.0.0の文字幅・結合文字表を使用します。複数コード
 
 `native/shell.hpp` はセッション固有の名前付きパイプと127.0.0.1限定のTCP通知を扱います。通知は16KiBを上限とし、TCPでは256bitのセッショントークンを照合します。接続途中の通知には2秒の期限があります。PowerShellは.NET、cmdはシェルのリダイレクト、Git Bashは標準のTCP機能から直接送信します。
 
-neo-termはGPL-3.0-or-laterです。libvterm **0.3.3** はMITで、ソースとライセンスを `vendor/libvterm/` に同梱しています。Emacsモジュールヘッダーは `vendor/emacs-module.h` です。
+neo-termはGPL-3.0-or-laterです。Emacsモジュールヘッダーは `vendor/emacs-module.h` です。独自エンジンは `native/terminal.cpp`、Unicodeの表とライセンスは `native/unicode-width.hpp` と `native/unicode-data/` にあります。
 
-libvtermには全角セルの再配置・履歴の属性/継続/プロンプト位置保持・カーソル保持と、受信途中のVT解釈状態に触れない画面クリアAPIを追加しています。`tests/vterm-reflow-test.cpp` がこれらを検証します。
+独自エンジンのUTF-8/VT分割受信、色・カーソル・モード・履歴・全角セルの再配置、入力符号化を `tests/terminal-test.cpp` で検証します。
 
-Unicodeの表は公式の [UnicodeData.txt](https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt) と [EastAsianWidth.txt](https://www.unicode.org/Public/16.0.0/ucd/EastAsianWidth.txt) から生成し、Unicode License V3を同梱しています。再生成は `python vendor/libvterm/update-unicode.py PATH/UnicodeData.txt PATH/EastAsianWidth.txt` です。
+Unicodeの表は公式の [UnicodeData.txt](https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt) と [EastAsianWidth.txt](https://www.unicode.org/Public/16.0.0/ucd/EastAsianWidth.txt) から生成し、Unicode License V3を同梱しています。再生成は `python tools/generate-unicode.py`、生成内容の照合は `python tools/generate-unicode.py --check` です。

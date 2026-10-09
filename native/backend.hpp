@@ -144,6 +144,9 @@ struct Screen {
     std::vector<std::string> clipboard;
     std::vector<std::string> shell_events;
     std::vector<std::vector<Cell>> lines;
+    // Incremental snapshots contain cells only for these row indices.
+    bool incremental = false;
+    std::vector<int> changed_rows;
     std::vector<std::string> history;
 
     struct HistoryRow {
@@ -223,7 +226,9 @@ public:
         return true;
     }
 
-    virtual void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr) {
+    virtual void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr,
+                                 const std::vector<HANDLE>& additional = {}) {
+        (void)additional;
         if (interrupt) {
             WaitForSingleObject(interrupt, timeout);
         } else {

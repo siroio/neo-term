@@ -11,14 +11,27 @@ class ScreenEncoder {
 
 public:
     std::string encode(const Screen& screen) {
-        if (cols_ != screen.cols || rows_ != screen.rows) {
+        if (screen.cols <= 0 || screen.rows <= 0 ||
+            screen.lines.size() > static_cast<size_t>(screen.rows)) {
+            throw std::runtime_error("Invalid screen dimensions or row count");
+        }
+        if (screen.incremental) {
+            for (const auto index : screen.changed_rows) {
+                if (index < 0 || index >= screen.rows ||
+                    static_cast<size_t>(index) >= screen.lines.size()) {
+                    throw std::runtime_error("Dirty screen row is out of bounds");
+                }
+            }
+        }
+        const bool resized = cols_ != screen.cols || rows_ != screen.rows;
+        if (resized) {
             previous_.assign(screen.rows, {});
             cols_ = screen.cols;
             rows_ = screen.rows;
         }
         std::string rows = "[";
         bool changed = false;
-        for (size_t index = 0; index < screen.lines.size(); ++index) {
+        const auto encode_row = [&](size_t index) {
             std::string line = "[";
             for (const auto& cell : screen.lines[index]) {
                 if (line.size() > 1) {
@@ -28,7 +41,7 @@ public:
             }
             line += ']';
             if (line == previous_[index]) {
-                continue;
+                return;
             }
             if (changed) {
                 rows += ',';
@@ -36,6 +49,15 @@ public:
             rows += '[' + std::to_string(index) + ',' + line + ']';
             previous_[index] = std::move(line);
             changed = true;
+        };
+        if (screen.incremental) {
+            for (const auto index : screen.changed_rows) {
+                encode_row(static_cast<size_t>(index));
+            }
+        } else {
+            for (size_t index = 0; index < screen.lines.size(); ++index) {
+                encode_row(index);
+            }
         }
         rows += ']';
         const auto cursor = "\"x\":" + std::to_string(screen.x) +
@@ -64,7 +86,7 @@ public:
         content_widths += ']';
         const auto state = cursor + ",\"continuations\":" + continuations +
                            ",\"content_widths\":" + content_widths;
-        if (!changed && state == cursor_ && screen.history.empty() && screen.history_rows.empty() &&
+        if (!resized && !changed && state == cursor_ && screen.history.empty() && screen.history_rows.empty() &&
             !screen.history_cleared && screen.clipboard.empty() && screen.shell_events.empty()) {
             return {};
         }

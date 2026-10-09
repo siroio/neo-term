@@ -66,32 +66,19 @@ try {
     }
 
     if (Test-Path -LiteralPath "$root/native/module.cpp") {
-        $include = "/I$root/vendor/libvterm/include"
-        $sources = Get-ChildItem -LiteralPath "$root/vendor/libvterm/src" -Filter '*.c' |
-            ForEach-Object FullName
-
-        & cl.exe @flags /std:c11 $include /c @sources
-
-        if ($LASTEXITCODE -ne 0) {
-            throw 'libvterm compilation failed.'
-        }
-
-        $objects = $sources | ForEach-Object {
-            $objectName = [IO.Path]::GetFileNameWithoutExtension($_) + '.obj'
-            Join-Path $output $objectName
-        }
-        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include "$root/tests/vterm-reflow-test.cpp" @objects /Fe:vterm-reflow-test.exe
+        $include = "/I$root/native"
+        & cl.exe @flags /std:c++17 /EHsc /W4 /WX $include "$root/tests/terminal-test.cpp" "$root/native/terminal.cpp" /Fe:terminal-test.exe
         if ($LASTEXITCODE -ne 0) {
             throw 'Terminal reflow test compilation failed.'
         }
         if ($Test) {
-            & ./vterm-reflow-test.exe
+            & ./terminal-test.exe
             if ($LASTEXITCODE -ne 0) {
                 throw 'Terminal reflow specifications failed.'
             }
         }
 
-        & cl.exe @flags /std:c++17 /Zc:__cplusplus /EHsc /W4 /WX /LD $include "$root/native/module.cpp" "$root/native/conpty.cpp" @objects /Fe:neo-term-module.dll user32.lib crypt32.lib ws2_32.lib bcrypt.lib
+        & cl.exe @flags /std:c++17 /Zc:__cplusplus /EHsc /W4 /WX /LD $include "$root/native/module.cpp" "$root/native/conpty.cpp" "$root/native/terminal.cpp" /Fe:neo-term-module.dll user32.lib crypt32.lib ws2_32.lib bcrypt.lib
         if ($LASTEXITCODE -ne 0) {
             throw 'Emacs module compilation failed.'
         }

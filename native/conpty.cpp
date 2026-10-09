@@ -1,8 +1,6 @@
 #include "backend.hpp"
-#include <vterm.h>
+#include "terminal.hpp"
 #include <condition_variable>
-#include <array>
-#include <cstdlib>
 #include <algorithm>
 
 namespace neo {
@@ -19,40 +17,22 @@ class Conpty final : public Backend {
     HPCON console_ = nullptr;
     Handle input_, output_, update_;
     bool bundled_;
+    bool child_exiting_ = false;
     std::wstring runtime_;
-    VTerm* terminal_ = nullptr;
-    VTermScreen* screen_ = nullptr;
+    std::unique_ptr<Terminal> terminal_;
     std::mutex state_mutex_, queue_mutex_, console_mutex_;
     std::condition_variable wake_;
+    std::condition_variable state_ready_;
+    std::atomic<unsigned> snapshots_waiting_{0};
     std::deque<std::string> pending_;
     size_t queued_ = 0;
-    std::deque<Screen::HistoryRow> history_;
-    std::vector<bool> continuations_;
-    bool resizing_ = false;
     std::thread reader_, writer_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> dirty_{true};
     std::atomic<bool> output_ended_{false};
     std::atomic<bool> reader_done_{false}, writer_done_{false};
     std::string failure_;
-    bool visible_ = true, alt_ = false;
-    int cursor_shape_ = 1;
-    bool cursor_blink_ = true;
-    std::string pending_osc_;
-    std::deque<std::string> shell_events_;
-    bool history_cleared_ = false;
-    std::string title_, pending_title_;
-    bool title_overflow_ = false;
-    int mouse_ = 0;
-    std::array<char, 4096> selection_buffer_{};
-    std::string pending_selection_;
-    bool selection_overflow_ = false;
-    std::deque<std::string> clipboard_;
     std::vector<unsigned char> attributes_;
-
-    static void output_callback(const char* bytes, size_t length, void* user) {
-        static_cast<Conpty*>(user)->enqueue(std::string(bytes, length));
-    }
 
     void enqueue(std::string bytes) {
         if (bytes.empty() || stopping_) {
@@ -69,199 +49,16 @@ class Conpty final : public Backend {
         wake_.notify_one();
     }
 
-    static int property_callback(VTermProp property, VTermValue* value, void* user) {
-        auto& self = *static_cast<Conpty*>(user);
-        if (property == VTERM_PROP_CURSORVISIBLE) {
-            self.visible_ = value->boolean != 0;
-        }
-        if (property == VTERM_PROP_CURSORSHAPE) {
-            self.cursor_shape_ = value->number;
-        }
-        if (property == VTERM_PROP_CURSORBLINK) {
-            self.cursor_blink_ = value->boolean != 0;
-        }
-        if (property == VTERM_PROP_ALTSCREEN) {
-            self.alt_ = value->boolean != 0;
-        }
-        if (property == VTERM_PROP_TITLE) {
-            const auto fragment = value->string;
-            if (fragment.initial) {
-                self.pending_title_.clear();
-                self.title_overflow_ = false;
-            }
-            if (self.pending_title_.size() + fragment.len > 16384) {
-                self.title_overflow_ = true;
-            }
-            if (!self.title_overflow_) {
-                self.pending_title_.append(fragment.str, fragment.len);
-            }
-            if (fragment.final && !self.title_overflow_) {
-                self.title_ = self.pending_title_;
-            }
-        }
-        if (property == VTERM_PROP_MOUSE) {
-            self.mouse_ = value->number;
-        }
-        return 1;
-    }
-
-    static int osc_callback(int command, VTermStringFragment fragment, void* user) {
-        auto& self = *static_cast<Conpty*>(user);
-        if (command != 133 && command != 7 && command != 51) {
-            return 0;
-        }
-        if (fragment.initial) {
-            self.pending_osc_.clear();
-        }
-        if (self.pending_osc_.size() + fragment.len > 16384) {
-            self.pending_osc_.assign(16385, ' ');
-            return 1;
-        }
-        self.pending_osc_.append(fragment.str, fragment.len);
-        if (fragment.final) {
-            if (command == 133) {
-                if (self.pending_osc_ == "A" || self.pending_osc_ == "B") {
-                    vterm_screen_mark_prompt(self.screen_, self.pending_osc_ == "A" ? 1 : 2);
-                }
-            } else {
-                if (self.shell_events_.size() == 32) {
-                    self.shell_events_.pop_front();
-                }
-                self.shell_events_.push_back(std::to_string(command) + ';' + self.pending_osc_);
-            }
-        }
-        return 1;
-    }
-
-    static int selection_callback(VTermSelectionMask, VTermStringFragment fragment, void* user) {
-        auto& self = *static_cast<Conpty*>(user);
-        if (fragment.initial) {
-            self.pending_selection_.clear();
-            self.selection_overflow_ = false;
-        }
-        if (self.pending_selection_.size() + fragment.len > 65536) {
-            self.selection_overflow_ = true;
-        }
-        if (!self.selection_overflow_) {
-            self.pending_selection_.append(fragment.str, fragment.len);
-        }
-        if (fragment.final && !self.selection_overflow_) {
-            try {
-                wide(self.pending_selection_);
-                if (self.clipboard_.size() == 8) {
-                    self.clipboard_.pop_front();
-                }
-                self.clipboard_.push_back(self.pending_selection_);
-            } catch (const std::exception&) {
-            }
-        }
-        return 1;
-    }
-
-    static int cursor_callback(VTermPos, VTermPos, int visible, void* user) {
-        static_cast<Conpty*>(user)->visible_ = visible != 0;
-        return 1;
-    }
-
-    void refresh_continuations(int begin, int end) {
-        if (resizing_) {
-            return;
-        }
-        int rows, cols;
-        vterm_get_size(terminal_, &rows, &cols);
-        continuations_.resize(rows);
-        auto state = vterm_obtain_state(terminal_);
-        for (int row = std::max(0, begin); row < std::min(rows, end); ++row) {
-            continuations_[row] = vterm_state_get_lineinfo(state, row)->continuation != 0;
-        }
-    }
-
-    static int damage_callback(VTermRect rect, void* user) {
-        static_cast<Conpty*>(user)->refresh_continuations(rect.start_row, rect.end_row + 1);
-        return 1;
-    }
-
-    static int move_callback(VTermRect dest, VTermRect src, void* user) {
-        static_cast<Conpty*>(user)->refresh_continuations(std::min(dest.start_row, src.start_row),
-                                                          std::max(dest.end_row, src.end_row));
-        return 1;
-    }
-
-    Cell convert_cell(const VTermScreenCell& source) {
-        Cell cell;
-        cell.text.clear();
-        for (const auto character : source.chars) {
-            if (!character) {
-                break;
-            }
-            cell.text += scalar(character);
-        }
-        if (cell.text.empty()) {
-            cell.text = " ";
-        }
-        cell.width = source.width > 0 ? source.width : 1;
-        cell.prompt = source.prompt;
-        cell.fg = color(source.fg);
-        cell.bg = color(source.bg);
-        cell.attributes = (source.attrs.bold ? 1 : 0) | (source.attrs.underline ? 2 : 0) |
-                          (source.attrs.italic ? 4 : 0) | (source.attrs.reverse ? 8 : 0) |
-                          (source.attrs.strike ? 16 : 0);
-        return cell;
-    }
-
-    static int pushline_callback(int cols, const VTermScreenCell* cells, void* user) {
-        auto& self = *static_cast<Conpty*>(user);
-        bool continuation = false;
-        if (!self.continuations_.empty()) {
-            continuation = self.continuations_.front();
-            self.continuations_.erase(self.continuations_.begin());
-            self.continuations_.push_back(false);
-        }
-        return self.store_history(cols, cells, continuation);
-    }
-
-    static int reflow_pushline_callback(int cols,
-                                        const VTermScreenCell* cells,
-                                        bool continuation,
-                                        void* user) {
-        return static_cast<Conpty*>(user)->store_history(cols, cells, continuation);
-    }
-
-    int store_history(int cols, const VTermScreenCell* cells, bool continuation) {
-        Screen::HistoryRow line;
-        line.continuation = continuation;
-        int end = cols;
-        while (end > 0 && cells[end - 1].chars[0] == 0 && cells[end - 1].prompt == 0 &&
-               (cells[end - 1].bg.type & VTERM_COLOR_DEFAULT_MASK) &&
-               !cells[end - 1].attrs.reverse) {
-            --end;
-        }
-        for (int col = 0; col < end; ++col) {
-            if (cells[col].chars[0] == UINT32_MAX) {
-                continue;
-            }
-            line.cells.push_back(convert_cell(cells[col]));
-        }
-        if (history_.size() == 2000) {
-            history_.pop_front();
-        }
-        history_.push_back(std::move(line));
-        return 1;
-    }
-
-    static int clear_callback(void* user) {
-        static_cast<Conpty*>(user)->history_.clear();
-        return 1;
-    }
-
     void read_output() {
         char bytes[16384];
         DWORD length;
         while (!stopping_ && ReadFile(output_.get(), bytes, sizeof(bytes), &length, nullptr) &&
                length) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            vterm_input_write(terminal_, bytes, length);
-            vterm_screen_flush_damage(screen_);
+            std::unique_lock<std::mutex> lock(state_mutex_);
+            // A continuously readable pipe must not starve the snapshot worker.
+            state_ready_.wait(lock, [this] { return !snapshots_waiting_ || stopping_; });
+            if (stopping_) { break; }
+            terminal_->feed(std::string_view(bytes, length));
             dirty_ = true;
             SetEvent(update_.get());
         }
@@ -302,14 +99,6 @@ class Conpty final : public Backend {
         }
     }
 
-    int color(VTermColor value) {
-        if (value.type & VTERM_COLOR_DEFAULT_MASK) {
-            return -1;
-        }
-        vterm_screen_convert_color_to_rgb(screen_, &value);
-        return (value.rgb.red << 16) | (value.rgb.green << 8) | value.rgb.blue;
-    }
-
 public:
     Conpty(const Options& options, bool bundled) : Backend(options), bundled_(bundled) {
     }
@@ -319,9 +108,6 @@ public:
         if (!attributes_.empty()) {
             DeleteProcThreadAttributeList(
                 reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes_.data()));
-        }
-        if (terminal_) {
-            vterm_free(terminal_);
         }
         if (library_) {
             FreeLibrary(library_);
@@ -376,38 +162,18 @@ public:
         }
         update_.reset(CreateEventW(nullptr, TRUE, TRUE, nullptr));
         wincheck(update_.get() != nullptr, "Create terminal update event");
-        terminal_ = vterm_new(options_.rows, options_.cols);
-        if (!terminal_) {
-            throw std::bad_alloc();
-        }
-        vterm_set_utf8(terminal_, 1);
-        vterm_output_set_callback(terminal_, output_callback, this);
-        screen_ = vterm_obtain_screen(terminal_);
-        vterm_screen_enable_reflow(screen_, true);
-        vterm_screen_enable_altscreen(screen_, 1);
-        static const VTermScreenCallbacks callbacks = {damage_callback,
-                                                       move_callback,
-                                                       cursor_callback,
-                                                       property_callback,
-                                                       nullptr,
-                                                       nullptr,
-                                                       pushline_callback,
-                                                       nullptr,
-                                                       clear_callback,
-                                                       reflow_pushline_callback};
-        vterm_screen_set_callbacks(screen_, &callbacks, this);
-        static const VTermStateFallbacks fallbacks = {
-            nullptr, nullptr, osc_callback, nullptr, nullptr, nullptr, nullptr};
-        vterm_screen_set_unrecognised_fallbacks(screen_, &fallbacks, this);
-        static const VTermSelectionCallbacks selection_callbacks = {selection_callback, nullptr};
-        vterm_state_set_selection_callbacks(vterm_obtain_state(terminal_),
-                                            &selection_callbacks,
-                                            this,
-                                            selection_buffer_.data(),
-                                            selection_buffer_.size());
-        vterm_screen_reset(screen_, 1);
+        terminal_ = std::make_unique<Terminal>(options_.cols, options_.rows,
+            [this](const std::string& bytes) { enqueue(bytes); });
         reader_ = std::thread([this] {
-            read_output();
+            try {
+                read_output();
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                failure_ = error.what();
+                dirty_ = true;
+                output_ended_ = true;
+                SetEvent(update_.get());
+            }
             reader_done_ = true;
         });
         writer_ = std::thread([this] {
@@ -440,15 +206,12 @@ public:
 
     void command(const Command& value) override {
         std::lock_guard<std::mutex> console_lock(console_mutex_);
-        if (!console_) {
-            return;
-        }
+        if (!console_) { return; }
         if (value.type == 'L') {
             wincheck(clear_ != nullptr, "Screen clear requires the ConPTY clear API");
             wincheck(SUCCEEDED(clear_(console_, FALSE)), "Clear pseudoconsole");
             std::lock_guard<std::mutex> lock(state_mutex_);
-            vterm_state_clear_screen(vterm_obtain_state(terminal_));
-            vterm_screen_flush_damage(screen_);
+            terminal_->clear_screen();
             dirty_ = true;
             SetEvent(update_.get());
             return;
@@ -456,151 +219,91 @@ public:
         if (value.type == 'R') {
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
-                resizing_ = true;
-                vterm_set_size(terminal_, value.second, value.first);
-                resizing_ = false;
-                refresh_continuations(0, value.second);
+                terminal_->resize(value.first, value.second);
                 dirty_ = true;
                 SetEvent(update_.get());
             }
-            const auto result = resize_(
-                console_, {static_cast<SHORT>(value.first), static_cast<SHORT>(value.second)});
-            if (FAILED(result)) {
-                throw std::runtime_error("ConPTY resize failed");
-            }
+            wincheck(SUCCEEDED(resize_(console_, {static_cast<SHORT>(value.first),
+                                                 static_cast<SHORT>(value.second)})),
+                     "ConPTY resize");
             return;
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (value.type == 'M') {
-            const auto modifiers = static_cast<VTermModifier>(value.fourth);
-            vterm_mouse_move(terminal_, value.first, value.second, modifiers);
-            if (value.third != 0) {
-                vterm_mouse_button(terminal_, std::abs(value.third), value.third > 0, modifiers);
-            }
-        } else if (value.type == 'H') {
-            history_.clear();
-            history_cleared_ = true;
+        terminal_->command(value);
+        if (terminal_->has_updates()) {
             dirty_ = true;
             SetEvent(update_.get());
-        } else if (value.type == 'K') {
-            vterm_keyboard_key(terminal_,
-                               static_cast<VTermKey>(value.first),
-                               static_cast<VTermModifier>(value.second));
-        } else if (value.type == 'U') {
-            vterm_keyboard_unichar(
-                terminal_, value.first, static_cast<VTermModifier>(value.second));
-        } else {
-            if (value.type == 'P') {
-                vterm_keyboard_start_paste(terminal_);
-            }
-            enqueue(value.text);
-            if (value.type == 'P') {
-                vterm_keyboard_end_paste(terminal_);
-            }
         }
     }
 
-    bool supports_clear() const override {
-        return clear_ != nullptr;
+    void shell_notification(const std::string& message) override {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        terminal_->shell_notification(message);
+        if (terminal_->has_updates()) {
+            dirty_ = true;
+            SetEvent(update_.get());
+        }
     }
+
+    bool supports_clear() const override { return clear_ != nullptr; }
 
     bool has_updates() override {
-        if (dirty_) {
-            return true;
-        }
+        if (dirty_) { return true; }
         std::lock_guard<std::mutex> lock(queue_mutex_);
         return !failure_.empty();
     }
 
-    void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr) override {
+    void wait_for_update(DWORD timeout, HANDLE interrupt = nullptr,
+                         const std::vector<HANDLE>& additional = {}) override {
         if (!has_updates()) {
-            const HANDLE events[] = {update_.get(), interrupt};
-            wincheck(WaitForMultipleObjects(interrupt ? 2 : 1, events, FALSE, timeout) != WAIT_FAILED,
-                     "Wait for terminal output");
+            std::vector<HANDLE> events{update_.get()};
+            if (interrupt) { events.push_back(interrupt); }
+            if (!child_exiting_ && process_.get()) { events.push_back(process_.get()); }
+            events.insert(events.end(), additional.begin(), additional.end());
+            wincheck(WaitForMultipleObjects(static_cast<DWORD>(events.size()), events.data(),
+                                           FALSE, timeout) != WAIT_FAILED,
+                     "Wait for terminal, input, process or shell event");
         }
     }
 
     void begin_exit() override {
         std::lock_guard<std::mutex> console_lock(console_mutex_);
+        child_exiting_ = true;
         Backend::begin_exit();
-        if (console_) {
-            close_(console_);
-            console_ = nullptr;
-        }
+        if (console_) { close_(console_); console_ = nullptr; }
     }
 
-    bool output_finished() override {
-        return output_ended_ && !has_updates();
-    }
+    bool output_finished() override { return output_ended_ && !has_updates(); }
 
     Screen snapshot() override {
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (!failure_.empty()) {
-                throw std::runtime_error(failure_);
-            }
+            if (!failure_.empty()) { throw std::runtime_error(failure_); }
         }
+        ++snapshots_waiting_;
         std::lock_guard<std::mutex> lock(state_mutex_);
-        dirty_ = false;
-        Screen result;
-        result.history_cleared = std::exchange(history_cleared_, false);
-        result.title = title_;
-        result.cursor_shape = cursor_shape_;
-        result.cursor_blink = cursor_blink_;
-        result.shell_events.assign(shell_events_.begin(), shell_events_.end());
-        shell_events_.clear();
-        result.mouse = mouse_;
-        result.clipboard.assign(clipboard_.begin(), clipboard_.end());
-        clipboard_.clear();
-        vterm_get_size(terminal_, &result.rows, &result.cols);
-        VTermPos cursor;
-        vterm_state_get_cursorpos(vterm_obtain_state(terminal_), &cursor);
-        result.x = cursor.col;
-        result.y = cursor.row;
-        result.visible = visible_;
-        result.alt = alt_;
-        refresh_continuations(0, result.rows);
-        result.continuations = continuations_;
-        for (int row = 0; row < result.rows; ++row) {
-            std::vector<Cell> line;
-            int content_width = 0;
-            for (int col = 0; col < result.cols; ++col) {
-                VTermScreenCell source{};
-                vterm_screen_get_cell(screen_, {row, col}, &source);
-                if (source.chars[0] == UINT32_MAX) {
-                    continue;
-                }
-                if (source.chars[0] || !(source.bg.type & VTERM_COLOR_DEFAULT_MASK) ||
-                    source.attrs.reverse) {
-                    content_width = col + std::max(1, static_cast<int>(source.width));
-                }
-                line.push_back(convert_cell(source));
+        struct SnapshotDone {
+            Conpty& owner;
+            ~SnapshotDone() {
+                --owner.snapshots_waiting_;
+                owner.state_ready_.notify_all();
             }
-            result.lines.push_back(std::move(line));
-            result.content_widths.push_back(content_width);
-        }
-        for (int index = 0; index < 64 && !history_.empty(); ++index) {
-            std::string text;
-            for (const auto& cell : history_.front().cells) {
-                text += cell.text;
-            }
-            result.history.push_back(std::move(text));
-            result.history_rows.push_back(std::move(history_.front()));
-            history_.pop_front();
-        }
-        dirty_ = !history_.empty();
-        if (!dirty_) {
-            ResetEvent(update_.get());
-        }
+        } done{*this};
+        auto result = terminal_->snapshot();
+        dirty_ = terminal_->has_updates();
+        if (!dirty_) { ResetEvent(update_.get()); }
         return result;
     }
 
     void stop() override {
-        if (stopping_.exchange(true)) {
-            return;
+        {
+            // Share the predicate mutex with write_input's condition-variable wait.
+            std::scoped_lock lock(queue_mutex_, state_mutex_);
+            if (stopping_.exchange(true)) { return; }
         }
         Backend::stop();
         wake_.notify_all();
+        state_ready_.notify_all();
         if (writer_.joinable()) {
             while (!writer_done_) {
                 CancelSynchronousIo(writer_.native_handle());

@@ -11,7 +11,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'Native specifications failed.'
     }
-    & ./build/vterm-reflow-test.exe
+    & ./build/terminal-test.exe
     if ($LASTEXITCODE -ne 0) {
         throw 'Terminal reflow specifications failed.'
     }

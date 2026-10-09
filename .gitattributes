@@ -1,1 +1,3 @@
 *.el text eol=lf
+# Preserve the official Unicode source bytes used by the generated SHA-256s.
+native/unicode-data/*.txt text eol=lf

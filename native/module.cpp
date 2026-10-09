@@ -139,10 +139,8 @@ class Session : public std::enable_shared_from_this<Session> {
                 if (history_pending) {
                     continue;
                 }
-                if (!frame.empty()) {
-                    WaitForSingleObject(wake_.get(), 8);
-                }
-                backend->wait_for_update(20, wake_.get());
+                if (stopping_) { break; }
+                backend->wait_for_update(shell.wait_timeout(), wake_.get(), shell.wait_handles());
             }
         } catch (const std::exception& error) {
             if (!stopping_) {

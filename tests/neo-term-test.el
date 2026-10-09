@@ -2,6 +2,109 @@
 (require 'ert)
 (require 'json)
 
+(ert-deftest neo-term-live-prompt-scan-retains-a-start-in-history ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-rich-screen
+     4 (vector (vector [["P" 1 -1 -1 0 1] [">" 1 -1 -1 0 0]
+                        [" " 1 -1 -1 0 0]] nil))
+     [[0 [["x" 1 -1 -1 0 2] [" " 1 -1 -1 0 0]
+          [" " 1 -1 -1 0 0] [" " 1 -1 -1 0 0]]]])
+    (neo-term--screen
+     '((cols . 4) (height . 2) (x . 2) (y . 0) (visible . t)
+       (rows . [[0 [["x" 1 -1 -1 0 2] ["y" 1 -1 -1 0 0]
+                    [" " 1 -1 -1 0 0] [" " 1 -1 -1 0 0]]]])))
+    (should (get-text-property 1 'neo-term-prompt))
+    (should (get-text-property (marker-position neo-term--screen-start) 'neo-term-prompt-end))))
+
+(ert-deftest neo-term-live-prompt-scan-includes-a-wrapped-prefix-in-history ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("LONG> "))
+    (neo-term-test-rich-screen
+     4 (vector (vector (neo-term-test-cells "LONG") nil))
+     (vector (vector 0 (neo-term-test-cells "> x "))) [t nil])
+    (neo-term--screen
+     `((cols . 4) (height . 2) (x . 4) (y . 0) (visible . t)
+       (continuations . [t nil])
+       (rows . ,(vector (vector 0 (neo-term-test-cells "> xy"))))))
+    (should (get-text-property 1 'neo-term-prompt))
+    (should (get-text-property (+ (marker-position neo-term--screen-start) 2)
+                               'neo-term-prompt-end))))
+
+(ert-deftest neo-term-live-input-does-not-rewrite-historical-prompts ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term--prompt-prefixes '("P> "))
+    (neo-term-test-rich-screen
+     8 (vector (vector (neo-term-test-cells "P> old") nil))
+     (vector (vector 0 (neo-term-test-cells "P> x    "))))
+    (let ((live-start (marker-position neo-term--screen-start)) historical-changes)
+      (add-hook 'after-change-functions
+                (lambda (begin _end _old)
+                  (when (< begin (1- live-start)) (push begin historical-changes))) nil t)
+      (neo-term--screen
+       `((cols . 8) (height . 2) (x . 4) (y . 0) (visible . t)
+         (rows . ,(vector (vector 0 (neo-term-test-cells "P> xy   "))))))
+      (should-not historical-changes)
+      (should (get-text-property 1 'neo-term-prompt))
+      (should (get-text-property (+ live-start 3) 'neo-term-prompt-end)))))
+
+(ert-deftest neo-term-row-edit-keeps-unchanged-cell-markers ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term--screen
+     `((cols . 6) (height . 2) (x . 0) (y . 0) (visible . t)
+       (rows . ,(vector (vector 0 (neo-term-test-cells "abcdef"))))))
+    (let ((prefix (copy-marker 2)) (suffix (copy-marker 6)))
+      (neo-term--screen
+       `((cols . 6) (height . 2) (x . 0) (y . 0) (visible . t)
+         (rows . ,(vector (vector 0 (neo-term-test-cells "abcXef"))))))
+      (should (= prefix 2))
+      (should (= suffix 6))
+      (should (equal (buffer-substring-no-properties 1 7) "abcXef")))))
+
+(ert-deftest neo-term-unchanged-prompts-do-not-modify-display-properties ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((inhibit-read-only t) (neo-term--updating t))
+      (insert (propertize "P> " 'neo-term-prompt-role 1)
+              (propertize "old\n" 'neo-term-prompt-role 2)
+              (propertize "P> " 'neo-term-prompt-role 1)
+              (propertize "next\n" 'neo-term-prompt-role 2))
+      (neo-term--mark-notified-prompts)
+      (let ((tick (buffer-modified-tick)))
+        (neo-term--mark-notified-prompts)
+        (should (= tick (buffer-modified-tick))))
+      ;; Removing a role must still remove its stale derived prompt markers.
+      (remove-text-properties 8 15 '(neo-term-prompt-role nil))
+      (neo-term--mark-notified-prompts)
+      (should (get-text-property 1 'neo-term-prompt))
+      (should (get-text-property 4 'neo-term-prompt-end))
+      (should-not (get-text-property 8 'neo-term-prompt))
+      (should-not (get-text-property 11 'neo-term-prompt-end)))))
+
+(ert-deftest neo-term-input-display-does-not-add-a-redraw-delay ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((noninteractive nil) delay)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (seconds &rest _) (setq delay seconds) 'scheduled)))
+        (neo-term--screen '((cols . 4) (height . 2) (x . 0) (y . 0)
+                            (visible . t) (rows . [])))
+        (should (= delay 0))))))
+
+(ert-deftest neo-term-row-insertion-batches-buffer-changes ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((inhibit-read-only t) (neo-term--updating t) (changes 0))
+      (setq neo-term--lines (vector (neo-term-test-cells "abcd")))
+      (add-hook 'after-change-functions (lambda (&rest _) (cl-incf changes)) nil t)
+      (neo-term--insert-row 0)
+      (should (equal (buffer-string) "abcd"))
+      ;; One text insertion and one display-protection property update.
+      (should (= changes 2)))))
+
 (defun neo-term-test-cells (text &optional color)
   (vconcat (mapcar (lambda (character)
                     (vector (char-to-string character) 1 (or color -1) -1 0))

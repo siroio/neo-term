@@ -77,6 +77,7 @@
 (defvar-local neo-term--rendered-continuations [])
 (defvar-local neo-term--rendered-content-widths [])
 (defvar-local neo-term--prompt-layout nil)
+(defvar-local neo-term--prompt-context nil)
 (defvar-local neo-term--cols 0)
 (defvar-local neo-term--height 0)
 (defvar-local neo-term--cursor '(0 . 0))
@@ -93,6 +94,13 @@
 (defvar-local neo-term--requested-size nil)
 (defvar-local neo-term--status "starting")
 (defvar-local neo-term--glyph-cache nil)
+(defvar neo-term--glyph-context nil)
+
+(defun neo-term--glyph-context ()
+  "Return the font and frame values shared by every cell in a render."
+  (list (frame-parameter nil 'font) (frame-char-width) (frame-char-height)
+        (face-attribute 'fixed-pitch :family nil t)
+        (face-foreground 'default nil t) (face-background 'default nil t)))
 (defvar-local neo-term--screen-start nil)
 (defvar-local neo-term--row-markers [])
 (defvar-local neo-term--rendered-lines [])
@@ -289,7 +297,7 @@
     (cond (neo-term--copy nil)
           (noninteractive (neo-term--render))
           ((null neo-term--timer)
-           (setq neo-term--timer (run-at-time .02 nil #'neo-term--render-buffer
+           (setq neo-term--timer (run-at-time 0 nil #'neo-term--render-buffer
                                               (current-buffer)))))))
 
 (defun neo-term--render-buffer (buffer)
@@ -300,14 +308,9 @@
 
 (defun neo-term--cell-display (text width face)
   (when (display-graphic-p)
-    (let* ((pixels (* width (frame-char-width)))
-           (key (list text width face (frame-parameter nil 'font)
-                      (frame-char-width)
-                      (frame-char-height)
-                      (face-attribute 'fixed-pitch
-                                      :family nil t)
-                      (face-foreground 'default nil t)
-                      (face-background 'default nil t)))
+    (let* ((context (or neo-term--glyph-context (neo-term--glyph-context)))
+           (pixels (* width (nth 1 context)))
+           (key (list text width face context))
            (cached (gethash key neo-term--glyph-cache 'missing)))
       (if (not (eq cached 'missing)) cached
         (let* ((base-face (append face '(:inherit fixed-pitch)))
@@ -356,6 +359,7 @@
 (defun neo-term--render ()
   (let ((inhibit-read-only t)
         (neo-term--updating t)
+        (neo-term--glyph-context (neo-term--glyph-context))
         (layout (list neo-term--cols neo-term--height neo-term--alt
                       (frame-parameter nil 'font) (frame-char-width)
                       (frame-char-height) (face-foreground 'default nil t)
@@ -368,19 +372,18 @@
                                 (aref neo-term--rendered-lines row))
                          (eq (aref neo-term--continuations row)
                              (aref neo-term--rendered-continuations row)))
-              (goto-char (aref neo-term--row-markers row))
-              (let ((begin (point)))
-                (delete-region begin (line-end-position))
-                (neo-term--insert-row row)
-                (set-marker (aref neo-term--row-markers row) begin)))))
+              (neo-term--update-row row))))
       (neo-term--rebuild-screen)
-      (setq neo-term--render-layout layout))
+      (setq neo-term--render-layout layout neo-term--prompt-context nil))
     (neo-term--mark-soft-newlines)
-    (let ((prompt-layout (list (buffer-chars-modified-tick) neo-term--prompt-prefixes
-                               neo-term--continuations neo-term--content-widths)))
+    (let* ((context (list neo-term--history-revision neo-term--render-layout
+                          neo-term--prompt-prefixes neo-term--exact-prompts))
+           (prompt-layout (list (buffer-chars-modified-tick) context
+                                neo-term--continuations neo-term--content-widths)))
       (unless (equal prompt-layout neo-term--prompt-layout)
-        (neo-term--mark-logical-prompts)
-        (setq neo-term--prompt-layout prompt-layout)))
+        (neo-term--mark-logical-prompts
+         (when (equal context neo-term--prompt-context) (neo-term--live-prompt-start)))
+        (setq neo-term--prompt-layout prompt-layout neo-term--prompt-context context)))
     (setq neo-term--rendered-lines (copy-sequence neo-term--lines)
           neo-term--rendered-continuations (copy-sequence neo-term--continuations)
           neo-term--rendered-content-widths (copy-sequence neo-term--content-widths))
@@ -394,11 +397,43 @@
     (neo-term--restore-display-protection)
     (set-buffer-modified-p nil)))
 
+(defun neo-term--update-row (row)
+  "Replace changed cells in ROW, retaining its unchanged prefix and suffix."
+  (let ((old (aref neo-term--rendered-lines row))
+        (new (aref neo-term--lines row))
+        (begin (marker-position (aref neo-term--row-markers row))))
+    (goto-char begin)
+    (if (and old new)
+        (let ((prefix 0) (old-end (length old)) (new-end (length new)))
+          (while (and (< prefix old-end) (< prefix new-end)
+                      (equal (aref old prefix) (aref new prefix)))
+            (forward-char (length (aref (aref old prefix) 0)))
+            (cl-incf prefix))
+          (while (and (> old-end prefix) (> new-end prefix)
+                      (equal (aref old (1- old-end)) (aref new (1- new-end))))
+            (cl-decf old-end)
+            (cl-decf new-end))
+          (let ((change-start (point)))
+            (delete-region change-start
+                           (+ change-start
+                              (cl-loop for index from prefix below old-end
+                                       sum (length (aref (aref old index) 0)))))
+            (when (< prefix new-end)
+              (insert (apply #'concat
+                             (cl-loop for index from prefix below new-end
+                                      collect (neo-term--cell-string (aref new index)))))
+              (add-text-properties change-start (point)
+                                   '(read-only t front-sticky (read-only)))))
+          (neo-term--mark-prompt begin (line-end-position)))
+      (delete-region begin (line-end-position))
+      (neo-term--insert-row row))
+    (set-marker (aref neo-term--row-markers row) begin)))
+
 (defun neo-term--insert-row (row)
   (let ((begin (point))
         (cells (aref neo-term--lines row)))
     (if cells
-        (cl-loop for cell across cells do (neo-term--insert-cell cell))
+        (insert (apply #'concat (mapcar #'neo-term--cell-string (append cells nil))))
       (insert (make-string neo-term--cols ?\s)))
     (add-text-properties begin (point)
                          '(read-only t front-sticky (read-only)))
@@ -409,7 +444,7 @@
     (let ((begin (point)))
       (if (stringp line)
           (insert line)
-        (cl-loop for cell across (aref line 0) do (neo-term--insert-cell cell)))
+        (insert (apply #'concat (mapcar #'neo-term--cell-string (append (aref line 0) nil)))))
       (insert "\n")
       (add-text-properties begin (point) '(read-only t front-sticky (read-only)))
       (when (and (vectorp line) (aref line 1) (> begin (point-min)))
@@ -505,12 +540,29 @@
                  (> (length prefix) (length longest)))
         (setq longest prefix)))))
 
-(defun neo-term--mark-logical-prompts ()
+(defun neo-term--live-prompt-start ()
+  "Find the live screen's prompt context, including a preceding wrapped prompt."
+  (let ((begin (save-excursion
+                 (goto-char neo-term--screen-start)
+                 (car (neo-term--logical-bounds)))))
+    (when neo-term--exact-prompts
+      (let ((position begin) done)
+        (while (and (not done) (> position (point-min)))
+          (let* ((role (get-text-property (1- position) 'neo-term-prompt-role))
+                 (previous (previous-single-property-change
+                            position 'neo-term-prompt-role nil (point-min))))
+            (cond ((and role (/= 0 (logand role 6))) (setq done t))
+                  ((and role (/= 0 (logand role 1)))
+                   (setq begin previous done t)))
+            (setq position previous)))))
+    begin))
+
+(defun neo-term--mark-logical-prompts (&optional begin)
   (if neo-term--exact-prompts
-      (neo-term--mark-notified-prompts)
+      (neo-term--mark-notified-prompts begin)
     (when neo-term--prompt-prefixes
       (save-excursion
-        (goto-char (point-min))
+        (goto-char (or begin (point-min)))
         (while (< (point) (point-max))
           (let* ((bounds (neo-term--logical-bounds))
                  (begin (car bounds)) (end (cdr bounds))
@@ -536,10 +588,25 @@
             (goto-char end)
             (forward-line 1)))))))
 
-(defun neo-term--mark-notified-prompts ()
-  (remove-text-properties (point-min) (point-max)
-                          '(neo-term-prompt nil neo-term-prompt-end nil))
-  (let ((position (point-min)) start)
+(defun neo-term--set-property-changes (begin end property value)
+  "Set PROPERTY to VALUE only on differing runs between BEGIN and END."
+  (while (setq begin (text-property-not-all begin end property value))
+    (let ((next (next-single-property-change begin property nil end)))
+      (if value (put-text-property begin next property value)
+        (remove-text-properties begin next (list property nil)))
+      (setq begin next))))
+
+(defun neo-term--sync-prompt-property (property spans &optional begin)
+  "Reconcile PROPERTY with sorted SPANS without rewriting unchanged text."
+  (let ((position (or begin (point-min))))
+    (dolist (span spans)
+      (neo-term--set-property-changes position (car span) property nil)
+      (neo-term--set-property-changes (car span) (cdr span) property t)
+      (setq position (cdr span)))
+    (neo-term--set-property-changes position (point-max) property nil)))
+
+(defun neo-term--mark-notified-prompts (&optional begin)
+  (let ((position (or begin (point-min))) start prompts ends)
     (while (< position (point-max))
       (let ((role (get-text-property position 'neo-term-prompt-role)))
         (when role
@@ -553,12 +620,14 @@
                           (or (get-text-property input 'neo-term-soft-wrap)
                               (get-text-property input 'neo-term-soft-padding)))
                 (cl-incf input))
-              (put-text-property start input 'neo-term-prompt t)
+              (push (cons start input) prompts)
               (when (< input (point-max))
-                (put-text-property input (1+ input) 'neo-term-prompt-end t)))
+                (push (cons input (1+ input)) ends)))
             (setq start nil))))
       (setq position (next-single-property-change position 'neo-term-prompt-role
-                                                  nil (point-max))))))
+                                                  nil (point-max))))
+    (neo-term--sync-prompt-property 'neo-term-prompt (nreverse prompts) begin)
+    (neo-term--sync-prompt-property 'neo-term-prompt-end (nreverse ends) begin)))
 
 (defun neo-term--mark-prompt (begin end)
   (let ((text (buffer-substring-no-properties begin end)))
@@ -688,7 +757,8 @@
   (setq buffer-read-only t)
   (add-hook 'before-change-functions #'neo-term--protect-display nil t))
 
-(defun neo-term--insert-cell (cell)
+(defun neo-term--cell-string (cell)
+  "Return CELL's text with its native width and display properties."
   (let ((text (aref cell 0))
         (width (aref cell 1)))
     (set-char-table-range char-width-table (aref text 0) width)
@@ -698,8 +768,13 @@
            (display (neo-term--cell-display text width face)))
       (let ((role (and (= (length cell) 6) (> (aref cell 5) 0) (aref cell 5))))
         (when role (setq neo-term--exact-prompts t))
-        (insert (propertize text 'face face 'display display
-                            'neo-term-prompt-role role))))))
+        (apply #'propertize text
+               (append (when face (list 'face face))
+                       (when display (list 'display display))
+                       (when role (list 'neo-term-prompt-role role))))))))
+
+(defun neo-term--insert-cell (cell)
+  (insert (neo-term--cell-string cell)))
 
 (defun neo-term--apply-cursor ()
   (setq cursor-type

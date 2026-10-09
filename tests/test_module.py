@@ -637,30 +637,17 @@ class ModuleSpecifications(unittest.TestCase):
                 session.send("M2,4,-1,0")
                 session.until(lambda e: "MOUSE=4,2 BUTTONS=0" in session.text())
 
-    def test_vim_edits_and_saves_a_file(self):
-        vim = os.environ.get("NEO_TERM_TEST_VIM") or shutil.which("vim.exe")
-        if not vim:
-            self.skipTest("set NEO_TERM_TEST_VIM to run a real Vim integration")
-        for backend in BACKENDS:
-            with self.subTest(backend=backend), tempfile.TemporaryDirectory(
-                dir=MODULE.parent
-            ) as folder:
-                path = Path(folder) / "vim-result.txt"
-                session, _ = self.run_session(
-                    backend, [vim, "-Nu", "NONE", "-n", "-i", "NONE",
-                              "--cmd", "set encoding=utf-8", str(path)]
-                )
-                session.until(lambda e: "vim-result.txt" in session.text())
-                session.send("TiNEO_VIM_OK 日本語😀e\u0301")
-                session.until(lambda e: "NEO_VIM_OK" in session.text())
-                for width, height in ((40, 10), (120, 40), (80, 24)) * 3:
-                    session.send(f"R{width},{height}")
-                    session.until(lambda e: e.get("cols") == width and e.get("height") == height)
-                session.send("K4,0")
-                session.send("T:wq")
-                session.send("K1,0")
-                session.until(lambda e: e["type"] == "exit")
-                self.assertEqual(path.read_text(encoding="utf-8").strip(), "NEO_VIM_OK 日本語😀e\u0301")
+    def test_emacs_keyboard_unicode_resize_and_copy(self):
+        environment = os.environ.copy()
+        environment["NEO_TERM_MODULE_TEST_SELECTOR"] = (
+            "neo-term-module-emacs-keyboard-unicode-resize-and-copy"
+        )
+        completed = subprocess.run(
+            [EMACS, "-Q", "--batch", "-l", str(ROOT / "tests" / "module-test.el")],
+            cwd=ROOT, env=environment, capture_output=True, timeout=90,
+        )
+        self.assertEqual(completed.returncode, 0,
+                         (completed.stdout + completed.stderr).decode("utf-8", errors="replace"))
 
     def test_pipe_disconnect_releases_owned_processes(self):
         for backend in BACKENDS:

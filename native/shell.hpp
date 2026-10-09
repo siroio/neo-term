@@ -35,6 +35,7 @@ class ShellBridge {
     std::wstring name_;
     Handle pipe_;
     Handle event_;
+    Handle listener_event_, connection_event_;
     OVERLAPPED operation_{};
     std::array<char, 16385> bytes_{};
     bool connecting_ = false;
@@ -53,6 +54,7 @@ class ShellBridge {
             const auto error = GetLastError();
             if (error == ERROR_PIPE_CONNECTED) {
                 connecting_ = false;
+                SetEvent(event_.get());
             } else {
                 wincheck(error == ERROR_IO_PENDING, "Accept shell notification connection");
             }
@@ -82,6 +84,11 @@ public:
                  "Read shell notification port");
         port_ = ntohs(address.sin_port);
         wincheck(listen(listener_.get(), 4) == 0, "Listen for shell notification");
+        listener_event_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        connection_event_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        wincheck(listener_event_.get() && connection_event_.get(), "Create shell socket events");
+        wincheck(WSAEventSelect(listener_.get(), listener_event_.get(), FD_ACCEPT) == 0,
+                 "Observe shell notification connections");
         u_long nonblocking = 1;
         wincheck(ioctlsocket(listener_.get(), FIONBIO, &nonblocking) == 0,
                  "Set shell notification socket mode");
@@ -110,15 +117,33 @@ public:
 
     unsigned short port() const { return port_; }
 
+    std::vector<HANDLE> wait_handles() const {
+        return {event_.get(), connection_.get() == INVALID_SOCKET
+                                  ? listener_event_.get() : connection_event_.get()};
+    }
+
+    DWORD wait_timeout() const {
+        if (connection_.get() == INVALID_SOCKET) { return INFINITE; }
+        const auto now = GetTickCount64();
+        return now >= deadline_ ? 0 : static_cast<DWORD>(deadline_ - now);
+    }
+
     std::string poll_socket() {
+        WSANETWORKEVENTS events{};
         if (connection_.get() == INVALID_SOCKET) {
+            wincheck(WSAEnumNetworkEvents(listener_.get(), listener_event_.get(), &events) == 0,
+                     "Read shell listener events");
             connection_.reset(accept(listener_.get(), nullptr, nullptr));
             if (connection_.get() == INVALID_SOCKET) { return {}; }
+            wincheck(WSAEventSelect(connection_.get(), connection_event_.get(),
+                                   FD_READ | FD_CLOSE) == 0, "Observe shell message input");
             u_long nonblocking = 1;
             ioctlsocket(connection_.get(), FIONBIO, &nonblocking);
             pending_.clear();
             deadline_ = GetTickCount64() + 2000;
         }
+        wincheck(WSAEnumNetworkEvents(connection_.get(), connection_event_.get(), &events) == 0,
+                 "Read shell connection events");
         char bytes[4096];
         while (pending_.size() <= 16449 && GetTickCount64() < deadline_) {
             const int length = recv(connection_.get(), bytes, sizeof(bytes), 0);
@@ -128,6 +153,7 @@ public:
             }
             if (length < 0 && WSAGetLastError() == WSAEWOULDBLOCK) { return {}; }
             connection_.reset();
+            ResetEvent(connection_event_.get());
             if (length == 0 && pending_.size() <= 16449 &&
                 pending_.compare(0, token_.size() + 1, token_ + '\n') == 0) {
                 return pending_.substr(token_.size() + 1);
@@ -136,6 +162,7 @@ public:
             return {};
         }
         connection_.reset();
+        ResetEvent(connection_event_.get());
         pending_.clear();
         return {};
     }
