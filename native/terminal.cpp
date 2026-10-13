@@ -59,7 +59,7 @@ std::string encode(uint32_t c) {
 }
 
 bool significant(const Cell& c) {
-    return c.text != " " || c.bg != -1 || (c.attributes & 8) || c.prompt;
+    return c.occupied || c.text != " " || c.bg != -1 || (c.attributes & 8) || c.prompt;
 }
 }
 
@@ -345,6 +345,7 @@ struct Terminal::State {
         }
         Cell c = pen;
         c.text = encode(cp);
+        c.occupied = true;
         c.width = w;
         c.prompt = role;
         r.cells[v.x] = std::move(c);

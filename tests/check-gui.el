@@ -49,6 +49,56 @@
                   (error "GUI native width mismatch: %s versus %s"
                          (- after origin) cell-width))))
           (kill-buffer buffer)))
+      (let ((buffer (generate-new-buffer "*neo-term-compact-width-check*")))
+        (unwind-protect
+            (progn
+              (pop-to-buffer buffer)
+              (neo-term-mode)
+              (neo-term--screen
+               '((cols . 6) (height . 2) (x . 3) (y . 0) (visible . t)
+                 (rows . [[0 [["日" 2 -1 -1 0 0 1] ["é" 1 -1 -1 0 0 1]
+                              [" " 1 -1 16711680 0 0 0] [" " 1 -1 -1 0 0 0]
+                              [" " 1 -1 -1 0 0 0]]]
+                          [1 [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                              [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                              [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]]])))
+              (neo-term--render)
+              (redisplay t)
+              (unless (equal (buffer-substring-no-properties (point-min) (point-max)) "日é \n")
+                (error "Compact display changed written Unicode or colored blanks"))
+              (let ((origin (car (posn-x-y (posn-at-point 1))))
+                    (cursor (car (posn-x-y (posn-at-point 4)))))
+                (unless (<= (abs (- (- cursor origin) (* 3 (frame-char-width)))) 1)
+                  (error "Compact GUI cursor lost its native column")))
+              (split-window-below)
+              (set-window-buffer (next-window) buffer)
+              (neo-term--render)
+              (redisplay t)
+              (dolist (window (get-buffer-window-list))
+                (unless (= (window-point window) 4)
+                  (error "Compact cursor differed between windows")))
+              (delete-other-windows)
+              (neo-term-copy-mode 1)
+              (unless (equal (buffer-substring-no-properties (point-min) (point-max))
+                             "日é   \n      ")
+                (error "Copy layout did not restore the complete cell grid"))
+              (neo-term-copy-mode -1)
+              (goto-char 1)
+              (push-mark 2 t t)
+              (neo-term--screen
+               '((cols . 3) (height . 2) (x . 0) (y . 0) (visible . t)
+                 (rows . [[0 [["B" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 0]
+                              [" " 1 -1 -1 0 0 0]]]
+                          [1 [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                              [" " 1 -1 -1 0 0 0]]]])))
+              (neo-term-copy-mode 1)
+              (unless (equal (neo-term--copy-text (region-beginning) (region-end)) "日")
+                (error "Pending GUI resize/output changed the copied selection"))
+              (redisplay t)
+              (neo-term-copy-mode -1)
+              (unless (string-prefix-p "B" (buffer-string))
+                (error "Copy exit did not catch up with pending GUI output")))
+          (kill-buffer buffer)))
       (let ((buffer (generate-new-buffer "*neo-term-history-check*")))
         (unwind-protect
             (progn
@@ -268,7 +318,10 @@
                  (lambda () (and (> neo-term--mouse 0)
                                  (string-match-p "FIXTURE_READY" (buffer-string)))))
                 (redisplay t)
-                (let ((position (posn-at-point (+ (aref neo-term--row-markers 2) 4))))
+                ;; Click the native grid, including cells omitted from buffer text.
+                (let ((position (posn-at-x-y (* 4 (frame-char-width))
+                                             (* 2 (frame-char-height))
+                                             (selected-window))))
                   (unless position (error "Mouse cell was not visible"))
                   (execute-kbd-macro
                    (vector (list 'down-mouse-1 position) (list 'mouse-1 position))))
@@ -278,7 +331,7 @@
             (when (buffer-live-p buffer) (kill-buffer buffer)))))
       (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)
         (insert
-         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; colored history/reflow/wrapped copy/prompt navigation; cursor shape/blink and file requests; ConPTY TUI/colors/alternate screen; bundled mouse; Unicode pixel width; keyboard Unicode/resize/copy round trip)\n"))
+         "GUI_TESTS=PASS (installed backends; protected input/copy, clear, PowerShell cwd/prompt; colored history/reflow/wrapped copy/prompt navigation; cursor shape/blink and file requests; ConPTY TUI/colors/alternate screen; bundled mouse on omitted cells; compact Unicode pixel width and multiple windows; keyboard Unicode/resize/copy round trip)\n"))
       (kill-emacs 0))
   (error
    (with-temp-file (expand-file-name "build/gui-check.log" neo-term-gui-root)

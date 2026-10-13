@@ -93,7 +93,7 @@ int main() try {
     const auto events = encoder.encode(screen);
     require(events.find("\"rows\":[]") != std::string::npos &&
                 events.find("\"history\":[\"scrollback\"]") != std::string::npos &&
-                events.find("\"history_rows\":[[[[\"old\",1,-1,-1,0,0]],true]]") != std::string::npos &&
+                events.find("\"history_rows\":[[[[\"old\",1,-1,-1,0,0,0]],true]]") != std::string::npos &&
                 events.find("\"history_cleared\":true") != std::string::npos &&
                 events.find("\"clipboard\":[\"copied\"]") != std::string::npos &&
                 events.find("\"shell_events\":[\"prompt\"]") != std::string::npos,

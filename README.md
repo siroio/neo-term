@@ -130,6 +130,14 @@ Unicode 16.0.0の文字幅・結合文字表を使用します。1セルに保�
 
 切り分け用の `tests/profile-display.el` はGUI版Emacsで、`tests/profile-prompts.el` はバッチ版Emacsで実行します。`tests/benchmark-input.el` に `NEO_TERM_BENCH_HISTORY=2000` を設定すると、PowerShell経由でOSC 133付きのプロンプト履歴を生成した後に入力を測定できます。詳細は `docs/superpowers/plans/2026-10-09-input-latency-profile.md` にあります。
 
+2026-10-13の表示最適化では、入力モードの現在画面から未使用の行末セルの文字展開を省略します。端末エンジンは書き込まれた空白を区別して保持し、色・属性・プロンプトのあるセルとカーソル位置に必要なセルも表示します。コピーモードでは全セルを表示し、選択範囲・位置・スクロールを保持します。端末のセルモデルとマウス報告の座標は全幅のままです。ConPTYがSPACEとして送る余白は、実際の空白と区別できないため保持します。
+
+同じDLL・byte compile済みLisp・GUI Emacs 31.1・PowerShellによる3回の単独比較では、入力から再表示までの中央値が約5.2〜5.4msから約2.8〜3.0msになりました。DirectWriteは有効のままです。物理キーの配送と画面走査は含みません。詳細と検証範囲は `docs/superpowers/plans/2026-10-13-vterm-display-comparison.md` にあります。
+
+この更新では `neo-term.el` と `build/neo-term-module.dll` を一緒に更新してください。読み込み済みのDLLを切り替えるにはEmacsの再起動が必要です。新しいLispは旧DLLのセル形式も受け取れますが、未使用セルを識別できないため省略しません。
+
+コピーへの切り替えでは、表示済みのセルから省略部分を補います。出力やリサイズが描画待ちでも選択対象を変えず、コピーを終了した時点で最新の端末状態へ追いつきます。通常入力の描画経路は変更しません。
+
 ## 構成とライセンス
 
 `native/module.cpp` はEmacsモジュールとセッションの寿命、`native/conpty.cpp` はConPTY/libvterm、`neo-term.el` は表示と操作です。画面通知は4MiB上限の長さ付きUTF-8 JSONです。Emacs APIはEmacsから呼ばれたモジュール関数内だけで使用します。通知をLispコードとして実行しません。

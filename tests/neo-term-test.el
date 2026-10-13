@@ -2,6 +2,185 @@
 (require 'ert)
 (require 'json)
 
+(ert-deftest neo-term-copy-entry-freezes-visible-text-before-a-pending-render ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen)
+    (goto-char 1)
+    (push-mark 2 t t)
+    (let ((noninteractive nil))
+      (neo-term--screen
+       '((cols . 3) (height . 2) (x . 0) (y . 0) (visible . t)
+         (history . ["new output"])
+         (rows . [[0 [["B" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 0]
+                      [" " 1 -1 -1 0 0 0]]]
+                  [1 [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                      [" " 1 -1 -1 0 0 0]]]])))
+      (neo-term-copy-mode 1)
+      (should (equal (neo-term--copy-text (region-beginning) (region-end)) "A"))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A     \n      "))
+      (neo-term-copy-mode -1)
+      (should (string-prefix-p "new output\nB" (buffer-string))))))
+
+(ert-deftest neo-term-repeated-copy-freeze-catches-up-with-resize-history-and-alt-screen ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (setq neo-term-scrollback-lines 8)
+    (neo-term-test-compact-screen)
+    (dotimes (step 80)
+      (goto-char neo-term--screen-start)
+      (let ((expected (buffer-substring-no-properties (point) (1+ (point))))
+            (cols (if (cl-evenp step) 3 6))
+            (height (if (cl-evenp step) 2 3)))
+        (push-mark (1+ (point)) t t)
+        (let* ((noninteractive nil)
+               (empty (vconcat (cl-loop repeat cols collect [" " 1 -1 -1 0 0 0])))
+               (first (copy-sequence empty)))
+          (if (= cols 3) (aset first 0 ["B" 1 -1 -1 0 0 1])
+            (setq first [["日" 2 -1 -1 0 0 1] ["é" 1 -1 -1 0 0 1]
+                         [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]))
+          (neo-term--screen
+           `((cols . ,cols) (height . ,height) (x . 0) (y . 0) (visible . t)
+             (alt . ,(= 0 (% step 4))) (history . ,(vector (format "history-%s" step)))
+             (rows . ,(vconcat (cons (vector 0 first)
+                                    (cl-loop for row from 1 below height collect (vector row empty)))))))
+          (neo-term-copy-mode 1)
+          (neo-term-copy-mode 1)
+          (should (equal (neo-term--copy-text (region-beginning) (region-end)) expected))
+          (neo-term-copy-mode -1)
+          (goto-char neo-term--screen-start)
+          (should (eq (char-after) (if (= cols 3) ?B ?日)))
+          (should (= (length neo-term--row-markers) height)))))))
+
+(ert-deftest neo-term-incremental-display-matches-rebuilt-cell-properties ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((patterns
+           [[[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+             [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]
+            [["P" 1 16711680 -1 1 1 1] [">" 1 16711680 -1 1 0 1] [" " 1 -1 -1 0 2 1]
+             ["x" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]
+            [["日" 2 -1 -1 0 0 1] ["é" 1 -1 -1 0 0 1] [" " 1 -1 255 0 0 0]
+             [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]
+            [["P" 1 -1 -1 0 0 1] [">" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 1]
+             ["y" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]]))
+      (dotimes (step 160)
+        (let ((row (% step 2)) (pattern (% (/ step 2) 4)))
+          (neo-term--screen
+           `((cols . 6) (height . 2) (x . ,(% (* step 3) 7)) (y . ,(% (/ step 3) 2))
+             (visible . t) (rows . ,(vector (vector row (aref patterns pattern))))
+             (continuations . ,(vector nil (= 0 (% step 3))))
+             (content_widths . [4 4])))
+          (let ((incremental (buffer-string))
+                (cursor (point)))
+            (setq neo-term--render-layout nil)
+            (neo-term--render)
+            (ert-info ((format "step=%s row=%s pattern=%s" step row pattern))
+              (should (equal-including-properties incremental (buffer-string)))
+              (should (= cursor (point))))))))))
+
+(defun neo-term-test-compact-screen (&optional cells x y)
+  (neo-term--screen
+   `((cols . 6) (height . 2) (x . ,(or x 0)) (y . ,(or y 0)) (visible . t)
+     (rows . ,(vector
+               (vector 0 (or cells [["A" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 1]
+                                    [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                                    [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]))
+               (vector 1 [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                          [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                          [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]))))))
+
+(ert-deftest neo-term-compact-display-preserves-written-spaces-and-copy ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A \n"))
+    (should (= (aref neo-term--row-markers 0) 1))
+    (should (= (aref neo-term--row-markers 1) 4))
+    (neo-term-copy-mode 1)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A     \n      "))
+    (should (equal (neo-term--copy-text 1 7) "A     "))
+    (neo-term-copy-mode -1)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A \n"))))
+
+(ert-deftest neo-term-compact-cursor-moves-without-new-cell-data ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen)
+    (neo-term--screen '((cols . 6) (height . 2) (x . 4) (y . 1) (visible . t) (rows . [])))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A \n     "))
+    (should (= (point) 8))
+    (neo-term--screen '((cols . 6) (height . 2) (x . 0) (y . 0) (visible . t) (rows . [])))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A \n"))
+    (should (= (point) 1))))
+
+(ert-deftest neo-term-compact-preserves-colored-and-wide-cells ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen
+     [["日" 2 -1 -1 0 0 1] ["é" 1 -1 -1 0 0 1] [" " 1 -1 16711680 0 0 0]
+      [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]] 3)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "日é \n"))
+    (should (= (point) 4))
+    (should (equal (plist-get (get-text-property 4 'face) :background) "#ff0000"))
+    (should-error (neo-term--validate-line [[" " 1 -1 -1 0 0 2]] 1))))
+
+(ert-deftest neo-term-compact-row-edits-grow-and-shrink-without-moving-other-rows ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen)
+    (neo-term-test-compact-screen
+     [["A" 1 -1 -1 0 0 1] [" " 1 -1 -1 0 0 1] ["B" 1 -1 -1 0 0 1]
+      [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]])
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "A B\n"))
+    (neo-term-test-compact-screen
+     [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+      [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]])
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) " \n"))
+    (should (= (aref neo-term--row-markers 1) 3))))
+
+(ert-deftest neo-term-compact-history-insertion-retains-an-empty-first-row ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen
+     [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+      [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]] 0 1)
+    (neo-term--screen '((cols . 6) (height . 2) (x . 0) (y . 1) (visible . t)
+                        (rows . []) (history . ["old"])))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max)) "old\n\n "))
+    (should (= neo-term--screen-start 5))
+    (should (= (aref neo-term--row-markers 0) 5))
+    (should (= (aref neo-term--row-markers 1) 6))))
+
+(ert-deftest neo-term-compact-copy-transition-keeps-point-and-selection ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (neo-term-test-compact-screen nil 0 1)
+    (goto-char 2)
+    (push-mark 4 t t)
+    (neo-term-copy-mode 1)
+    (should (= (point) 2))
+    (should (= (mark) 8))
+    (should mark-active)))
+
+(ert-deftest neo-term-compact-cursor-expansion-updates-soft-padding ()
+  (with-temp-buffer
+    (neo-term-mode)
+    (let ((empty [[" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                 [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]
+                 [" " 1 -1 -1 0 0 0] [" " 1 -1 -1 0 0 0]]))
+      (let ((first (copy-sequence empty)) (last (copy-sequence empty)))
+        (aset first 0 ["A" 1 -1 -1 0 0 1])
+        (aset last 0 ["B" 1 -1 -1 0 0 1])
+        (neo-term--screen
+         `((cols . 6) (height . 3) (x . 0) (y . 2) (visible . t)
+           (continuations . [nil t t]) (content_widths . [1 0 1])
+           (rows . ,(vector (vector 0 first) (vector 1 empty) (vector 2 last))))))
+      (neo-term--screen
+       '((cols . 6) (height . 3) (x . 4) (y . 1) (visible . t)
+         (continuations . [nil t t]) (content_widths . [1 0 1]) (rows . [])))
+      (should (equal (neo-term--copy-text (point-min) (point-max)) "AB")))))
+
 (ert-deftest neo-term-live-prompt-scan-retains-a-start-in-history ()
   (with-temp-buffer
     (neo-term-mode)

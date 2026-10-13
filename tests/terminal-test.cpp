@@ -23,6 +23,22 @@ static std::string text(const Screen& s) {
 }
 
 int main() try {
+    Terminal blanks(8, 2, [](const std::string&) {});
+    blanks.feed(" ");
+    auto blank_screen = blanks.snapshot();
+    require(cell_json(blank_screen.lines[0][0]) == "[\" \",1,-1,-1,0,0,1]",
+            "written space is distinguished from an unused cell");
+    require(cell_json(blank_screen.lines[0][7]) == "[\" \",1,-1,-1,0,0,0]",
+            "unused cell occupancy is sent to Lisp");
+    blanks.feed("\r\x1b[K");
+    blank_screen = blanks.snapshot();
+    require(cell_json(blank_screen.lines[0][0]) == "[\" \",1,-1,-1,0,0,0]",
+            "erase resets occupancy");
+    blanks.feed("a  ");
+    blanks.resize(4, 2);
+    blank_screen = blanks.snapshot();
+    require(cell_json(blank_screen.lines[0][2]) == "[\" \",1,-1,-1,0,0,1]",
+            "resize retains an explicitly written trailing space");
     std::string output;
     Terminal t(10, 4, [&](const std::string& s) {
         output += s;

@@ -121,12 +121,14 @@ struct Cell {
     int bg = -1;
     int attributes = 0;
     int prompt = 0;
+    bool occupied = false;
 };
 
 inline std::string cell_json(const Cell& cell) {
     return '[' + json_string(cell.text) + ',' + std::to_string(cell.width) + ',' +
            std::to_string(cell.fg) + ',' + std::to_string(cell.bg) + ',' +
-           std::to_string(cell.attributes) + ',' + std::to_string(cell.prompt) + ']';
+           std::to_string(cell.attributes) + ',' + std::to_string(cell.prompt) + ',' +
+           (cell.occupied ? '1' : '0') + ']';
 }
 
 struct Screen {

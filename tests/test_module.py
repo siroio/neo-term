@@ -394,7 +394,7 @@ class ModuleSpecifications(unittest.TestCase):
                 )
                 session.until(
                     lambda e: any(
-                        len(cell) == 6 and cell[5] & 6
+                        len(cell) >= 6 and cell[5] & 6
                         for row in session.rows.values()
                         for cell in row
                     )
@@ -403,7 +403,7 @@ class ModuleSpecifications(unittest.TestCase):
                     cell
                     for row in session.rows.values()
                     for cell in row
-                    if len(cell) == 6 and cell[5]
+                    if len(cell) >= 6 and cell[5]
                 ]
                 self.assertTrue(any(cell[0] == "C" and cell[5] & 1 for cell in marked))
 
